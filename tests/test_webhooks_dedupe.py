@@ -1,8 +1,9 @@
-"""Unit tests for ``claim_github_webhook_delivery`` and ``mark_github_webhook_delivery_processed`` (issue #154)."""
+"""Unit tests for delivery claim lease, release, and mark_processed (issue #154)."""
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from reviewgate.app.settings import AppSettings
 from reviewgate.app.webhooks.dedupe import (
     claim_github_webhook_delivery,
     mark_github_webhook_delivery_processed,
+    release_github_webhook_delivery,
 )
 
 
@@ -54,7 +56,7 @@ def test_mark_github_webhook_delivery_processed_requires_database_url() -> None:
 def test_claim_github_webhook_delivery_new_row_claimed(
     app_settings: AppSettings,
 ) -> None:
-    """When delivery is new, upsert inserts and returns 'claimed'."""
+    """1. New delivery can be claimed."""
     fake_engine = object()
     session = MagicMock()
     first_result = MagicMock()
@@ -81,40 +83,10 @@ def test_claim_github_webhook_delivery_new_row_claimed(
     session.commit.assert_called_once()
 
 
-def test_claim_github_webhook_delivery_unprocessed_existing_row_claimed(
+def test_claim_github_webhook_delivery_processed_is_duplicate(
     app_settings: AppSettings,
 ) -> None:
-    """Issue #154: When delivery exists with processed=False, atomic DO UPDATE succeeds and returns 'claimed'."""
-    fake_engine = object()
-    session = MagicMock()
-    exec_result = MagicMock()
-    exec_result.scalar_one_or_none.return_value = uuid.uuid4()
-    session.execute.return_value = exec_result
-    sm = _session_context(session)
-
-    with patch(
-        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
-        return_value=fake_engine,
-    ):
-        with patch(
-            "reviewgate.app.webhooks.dedupe.create_session_factory",
-            return_value=sm,
-        ):
-            result = claim_github_webhook_delivery(
-                app_settings,
-                delivery_id="deliv-retry-1",
-                event_name="pull_request",
-            )
-
-    assert result == "claimed"
-    session.execute.assert_called_once()
-    session.commit.assert_called_once()
-
-
-def test_claim_github_webhook_delivery_processed_existing_row_duplicate(
-    app_settings: AppSettings,
-) -> None:
-    """When delivery exists with processed=True, DO UPDATE WHERE fails, returning no row and yielding 'duplicate'."""
+    """2. Processed delivery (processed=True) fails the update WHERE clause, yielding 'duplicate'."""
     fake_engine = object()
     session = MagicMock()
     exec_result = MagicMock()
@@ -132,13 +104,136 @@ def test_claim_github_webhook_delivery_processed_existing_row_duplicate(
         ):
             result = claim_github_webhook_delivery(
                 app_settings,
-                delivery_id="deliv-dup-1",
+                delivery_id="deliv-processed-dup",
                 event_name="pull_request",
             )
 
     assert result == "duplicate"
     session.execute.assert_called_once()
     session.commit.assert_called_once()
+
+
+def test_claim_github_webhook_delivery_unprocessed_released_can_retry(
+    app_settings: AppSettings,
+) -> None:
+    """3. Unprocessed failed delivery (released/stale) updates the lease and succeeds on retry."""
+    fake_engine = object()
+    session = MagicMock()
+    exec_result = MagicMock()
+    exec_result.scalar_one_or_none.return_value = uuid.uuid4()
+    session.execute.return_value = exec_result
+    sm = _session_context(session)
+
+    with patch(
+        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
+        return_value=fake_engine,
+    ):
+        with patch(
+            "reviewgate.app.webhooks.dedupe.create_session_factory",
+            return_value=sm,
+        ):
+            result = claim_github_webhook_delivery(
+                app_settings,
+                delivery_id="deliv-retry-ok",
+                event_name="pull_request",
+            )
+
+    assert result == "claimed"
+    session.execute.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_claim_github_webhook_delivery_concurrent_in_progress_is_duplicate(
+    app_settings: AppSettings,
+) -> None:
+    """4. A concurrent/in-progress delivery cannot be claimed while another request holds an active lease."""
+    fake_engine = object()
+    session = MagicMock()
+    # When claimed_at is within the active lease window, WHERE claimed_at < cutoff fails -> returns None
+    exec_result = MagicMock()
+    exec_result.scalar_one_or_none.return_value = None
+    session.execute.return_value = exec_result
+    sm = _session_context(session)
+
+    with patch(
+        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
+        return_value=fake_engine,
+    ):
+        with patch(
+            "reviewgate.app.webhooks.dedupe.create_session_factory",
+            return_value=sm,
+        ):
+            result = claim_github_webhook_delivery(
+                app_settings,
+                delivery_id="deliv-in-flight",
+                event_name="pull_request",
+            )
+
+    assert result == "duplicate"
+    session.execute.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_claim_github_webhook_delivery_expired_lease_reclaims(
+    app_settings: AppSettings,
+) -> None:
+    """5. An expired processing lease (e.g. after worker/process crash) is reclaimed by subsequent retry."""
+    fake_engine = object()
+    session = MagicMock()
+    exec_result = MagicMock()
+    exec_result.scalar_one_or_none.return_value = uuid.uuid4()
+    session.execute.return_value = exec_result
+    sm = _session_context(session)
+
+    with patch(
+        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
+        return_value=fake_engine,
+    ):
+        with patch(
+            "reviewgate.app.webhooks.dedupe.create_session_factory",
+            return_value=sm,
+        ):
+            result = claim_github_webhook_delivery(
+                app_settings,
+                delivery_id="deliv-crashed-reclaimed",
+                event_name="pull_request",
+                lease_timeout_seconds=30,
+            )
+
+    assert result == "claimed"
+    session.execute.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_release_github_webhook_delivery_success(
+    app_settings: AppSettings,
+) -> None:
+    """release_github_webhook_delivery resets claimed_at to epoch so retry is immediately claimable."""
+    fake_engine = object()
+    session = MagicMock()
+    sm = _session_context(session)
+
+    with patch(
+        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
+        return_value=fake_engine,
+    ):
+        with patch(
+            "reviewgate.app.webhooks.dedupe.create_session_factory",
+            return_value=sm,
+        ):
+            release_github_webhook_delivery(
+                app_settings,
+                delivery_id="deliv-fail-release",
+            )
+
+    session.execute.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_release_github_webhook_delivery_noop_when_database_url_unset() -> None:
+    """release_github_webhook_delivery handles unset database_url gracefully."""
+    settings = AppSettings(database_url=None)
+    release_github_webhook_delivery(settings, delivery_id="d1")
 
 
 def test_claim_github_webhook_delivery_database_error_returns_unavailable(
@@ -171,7 +266,7 @@ def test_claim_github_webhook_delivery_database_error_returns_unavailable(
 def test_mark_github_webhook_delivery_processed_success(
     app_settings: AppSettings,
 ) -> None:
-    """mark_github_webhook_delivery_processed executes update and commits."""
+    """mark_github_webhook_delivery_processed executes update setting processed=True and commits."""
     fake_engine = object()
     session = MagicMock()
     sm = _session_context(session)
@@ -196,7 +291,7 @@ def test_mark_github_webhook_delivery_processed_success(
 def test_mark_github_webhook_delivery_processed_operational_error_raises(
     app_settings: AppSettings,
 ) -> None:
-    """OperationalError rolls back and re-raises."""
+    """OperationalError during mark_processed rolls back and re-raises."""
     fake_engine = object()
     session = MagicMock()
     session.execute.side_effect = OperationalError("conn failed", {}, Exception())

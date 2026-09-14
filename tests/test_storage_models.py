@@ -25,7 +25,7 @@ from reviewgate.app.storage.models import Base
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 _ALEMBIC_INI: Final[Path] = _REPO_ROOT / "alembic.ini"
-_EXPECTED_ALEMBIC_HEAD: Final[str] = "16_1_0002"
+_EXPECTED_ALEMBIC_HEAD: Final[str] = "16_1_0003"
 
 _EXPECTED_TABLES: Final[frozenset[str]] = frozenset(
     {

@@ -39,6 +39,7 @@ from reviewgate.app.settings import AppSettings
 from reviewgate.app.webhooks.dedupe import (
     claim_github_webhook_delivery,
     mark_github_webhook_delivery_processed,
+    release_github_webhook_delivery,
 )
 from reviewgate.app.webhooks.enqueue_analysis_dedupe import (
     evaluate_pull_request_enqueue_dedupe,
@@ -159,11 +160,21 @@ async def _handle_installation_style_webhook(
             payload=payload,
         )
     except ValueError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
     except OperationalError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Temporary database error while persisting installation data",
@@ -285,12 +296,28 @@ async def github_webhook(request: Request) -> Response:
             payload_obj,
         )
     except OperationalError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Temporary database error while checking installation status",
         ) from exc
 
     if not may_enqueue:
+        try:
+            await run_in_threadpool(
+                mark_github_webhook_delivery_processed,
+                settings,
+                delivery_id=delivery_id,
+            )
+        except OperationalError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Temporary database error while recording webhook delivery",
+            ) from exc
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
     try:
@@ -300,17 +327,38 @@ async def github_webhook(request: Request) -> Response:
             payload_obj,
         )
     except ValueError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
     except redis.exceptions.RedisError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Temporary Redis error while coalescing synchronize webhooks",
         ) from exc
 
     if not debounce_allows:
+        try:
+            await run_in_threadpool(
+                mark_github_webhook_delivery_processed,
+                settings,
+                delivery_id=delivery_id,
+            )
+        except OperationalError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Temporary database error while recording webhook delivery",
+            ) from exc
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
     try:
@@ -320,12 +368,28 @@ async def github_webhook(request: Request) -> Response:
             payload_obj,
         )
     except OperationalError as exc:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Temporary database error while checking completed analyses",
         ) from exc
 
     if skip_completed:
+        try:
+            await run_in_threadpool(
+                mark_github_webhook_delivery_processed,
+                settings,
+                delivery_id=delivery_id,
+            )
+        except OperationalError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Temporary database error while recording webhook delivery",
+            ) from exc
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
     install_redis_broker(settings)
@@ -353,7 +417,15 @@ async def github_webhook(request: Request) -> Response:
 
     envelope.update(reviewgate_fields)
 
-    run_pr_analysis_stub.send(envelope)
+    try:
+        run_pr_analysis_stub.send(envelope)
+    except Exception:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+        )
+        raise
 
     try:
         await run_in_threadpool(

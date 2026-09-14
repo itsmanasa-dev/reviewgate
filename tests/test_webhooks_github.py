@@ -59,6 +59,11 @@ def _stub_github_webhook_delivery_claim(monkeypatch: pytest.MonkeyPatch) -> None
         "mark_github_webhook_delivery_processed",
         lambda *_a, **_k: None,
     )
+    monkeypatch.setattr(
+        github_webhook_module,
+        "release_github_webhook_delivery",
+        lambda *_a, **_k: None,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1054,3 +1059,150 @@ def test_github_webhook_mark_processed_database_unavailable_returns_503(
 
     assert response.status_code == 503
     send.assert_called_once()
+
+
+def test_github_webhook_pull_request_enqueue_blocked_marks_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Soft-deleted/blocked enqueue path acknowledges 202 and marks delivery processed."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "pull_request_may_enqueue",
+        return_value=False,
+    ):
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-blocked-1",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 202
+    send.assert_not_called()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-blocked-1"
+
+
+def test_github_webhook_synchronize_debounce_coalesced_marks_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Coalesced synchronize webhook acknowledges 202 and marks delivery processed."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "synchronize_debounce_allows_enqueue",
+        return_value=False,
+    ):
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-coalesced-1",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 202
+    send.assert_not_called()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-coalesced-1"
+
+
+def test_github_webhook_skip_completed_analysis_marks_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Skipped completed analysis acknowledges 202 and marks delivery processed."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "evaluate_pull_request_enqueue_dedupe",
+        return_value=(True, {}),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-skip-completed-1",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 202
+    send.assert_not_called()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-skip-completed-1"
+
+
+def test_github_webhook_installation_created_marks_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Successful installation persistence marks delivery processed."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.delenv("REVIEWGATE_REDIS_URL", raising=False)
+    body = (
+        b'{"action":"created","installation":{'
+        b'"id":12345,"account":{"login":"acme","type":"Organization"}},'
+        b'"repositories":[]}'
+    )
+
+    with patch.object(
+        github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+    ) as mock_mark:
+        with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
+            with TestClient(create_app()) as client:
+                response = client.post(
+                    "/webhooks/github",
+                    content=body,
+                    headers={
+                        "x-hub-signature-256": _signature(body, secret),
+                        "x-github-delivery": "delivery-inst-created-1",
+                        "x-github-event": "installation",
+                    },
+                )
+
+    assert response.status_code == 202
+    send.assert_not_called()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-inst-created-1"
