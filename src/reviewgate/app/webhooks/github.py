@@ -36,7 +36,10 @@ from reviewgate.app.analysis.synchronize_debounce import (
     synchronize_debounce_allows_enqueue,
 )
 from reviewgate.app.settings import AppSettings
-from reviewgate.app.webhooks.dedupe import claim_github_webhook_delivery
+from reviewgate.app.webhooks.dedupe import (
+    claim_github_webhook_delivery,
+    mark_github_webhook_delivery_processed,
+)
 from reviewgate.app.webhooks.enqueue_analysis_dedupe import (
     evaluate_pull_request_enqueue_dedupe,
 )
@@ -164,6 +167,18 @@ async def _handle_installation_style_webhook(
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Temporary database error while persisting installation data",
+        ) from exc
+
+    try:
+        await run_in_threadpool(
+            mark_github_webhook_delivery_processed,
+            settings,
+            delivery_id=delivery_id,
+        )
+    except OperationalError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Temporary database error while recording webhook delivery",
         ) from exc
 
     return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -339,5 +354,17 @@ async def github_webhook(request: Request) -> Response:
     envelope.update(reviewgate_fields)
 
     run_pr_analysis_stub.send(envelope)
+
+    try:
+        await run_in_threadpool(
+            mark_github_webhook_delivery_processed,
+            settings,
+            delivery_id=delivery_id,
+        )
+    except OperationalError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Temporary database error while recording webhook delivery",
+        ) from exc
 
     return Response(status_code=status.HTTP_202_ACCEPTED)

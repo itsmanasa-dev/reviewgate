@@ -380,6 +380,11 @@ def test_webhook_pull_request_synchronize_enqueues_when_debounce_allows(
     )
     monkeypatch.setattr(
         github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        github_webhook_module,
         "persist_installation_webhook_payload",
         lambda *_a, **_k: None,
     )

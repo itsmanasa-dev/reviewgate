@@ -54,6 +54,11 @@ def _stub_github_webhook_delivery_claim(monkeypatch: pytest.MonkeyPatch) -> None
         "claim_github_webhook_delivery",
         _claim,
     )
+    monkeypatch.setattr(
+        github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+        lambda *_a, **_k: None,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -850,3 +855,202 @@ def test_github_webhook_reinstalls_broker_when_redis_url_changes(
 
     assert broker_urls == ["redis://host-a:6379/0", "redis://host-b:6379/0"]
     assert send.call_count == 2
+
+
+def test_github_webhook_successful_enqueue_marks_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Successful enqueue marks the delivery as processed."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+    ) as mock_mark:
+        with patch(
+            "reviewgate.app.analysis.broker_install.RedisBroker",
+            lambda **_: StubBroker(),
+        ):
+            with patch(
+                "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+            ) as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-enqueue-ok",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 202
+    send.assert_called_once()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-enqueue-ok"
+
+
+def test_github_webhook_enqueue_failure_does_not_mark_delivery_processed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: If enqueue fails, delivery is NOT marked processed so it can be retried."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+    ) as mock_mark:
+        with patch(
+            "reviewgate.app.analysis.broker_install.RedisBroker",
+            lambda **_: StubBroker(),
+        ):
+            with patch(
+                "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+                side_effect=RuntimeError("transient queue failure"),
+            ):
+                with TestClient(create_app(), raise_server_exceptions=False) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-enqueue-fail",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 500
+    mock_mark.assert_not_called()
+
+
+def test_github_webhook_unprocessed_delivery_retry_enqueues_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: An unprocessed delivery can be retried and successfully enqueued."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    # Simulate claim_github_webhook_delivery returning "claimed" on retry of unprocessed delivery
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value="claimed",
+    ) as mock_claim:
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch(
+                "reviewgate.app.analysis.broker_install.RedisBroker",
+                lambda **_: StubBroker(),
+            ):
+                with patch(
+                    "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+                ) as send:
+                    with TestClient(create_app()) as client:
+                        response = client.post(
+                            "/webhooks/github",
+                            content=body,
+                            headers={
+                                "x-hub-signature-256": _signature(body, secret),
+                                "x-github-delivery": "delivery-retry-ok",
+                                "x-github-event": "pull_request",
+                            },
+                        )
+
+    assert response.status_code == 202
+    mock_claim.assert_called_once()
+    send.assert_called_once()
+    mock_mark.assert_called_once()
+    assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-retry-ok"
+
+
+def test_github_webhook_processed_delivery_is_treated_as_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: A processed delivery is treated as duplicate and not re-enqueued."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    # Simulate claim_github_webhook_delivery returning "duplicate" because delivery is already processed
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value="duplicate",
+    ) as mock_claim:
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch(
+                "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+            ) as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-already-processed",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 202
+    mock_claim.assert_called_once()
+    send.assert_not_called()
+    mock_mark.assert_not_called()
+
+
+def test_github_webhook_mark_processed_database_unavailable_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Database failure while marking processed yields 503."""
+
+    from sqlalchemy.exc import OperationalError
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "mark_github_webhook_delivery_processed",
+        side_effect=OperationalError("db conn lost", {}, Exception()),
+    ):
+        with patch(
+            "reviewgate.app.analysis.broker_install.RedisBroker",
+            lambda **_: StubBroker(),
+        ):
+            with patch(
+                "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+            ) as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-db-err",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 503
+    send.assert_called_once()
