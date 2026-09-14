@@ -23,7 +23,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from typing import Any, Final
+import uuid
+from typing import Final
 
 import redis.exceptions
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -81,6 +82,41 @@ def _verify_signature_sha256(
     key_bytes = secret.get_secret_value().encode("utf-8")
     computed = hmac.new(key_bytes, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed, expected_hex)
+
+
+async def _cleanup_delivery_failure(
+    settings: AppSettings,
+    payload_obj: dict[str, object] | None,
+    *,
+    delivery_id: str,
+    claim_token: uuid.UUID | None,
+) -> None:
+    """Safely cleanup debounce reservation first, then database delivery claim.
+
+    Ensures the delivery-owned debounce reservation is released before releasing
+    the PostgreSQL claim. If either cleanup step fails, the other is still attempted.
+    """
+
+    if payload_obj is not None:
+        try:
+            await run_in_threadpool(
+                release_synchronize_debounce,
+                settings,
+                payload_obj,
+                delivery_id=delivery_id,
+            )
+        except Exception:
+            pass
+
+    try:
+        await run_in_threadpool(
+            release_github_webhook_delivery,
+            settings,
+            delivery_id=delivery_id,
+            claim_token=claim_token,
+        )
+    except Exception:
+        pass
 
 
 async def _handle_installation_style_webhook(
@@ -167,9 +203,9 @@ async def _handle_installation_style_webhook(
             payload=payload,
         )
     except ValueError as exc:
-        await run_in_threadpool(
-            release_github_webhook_delivery,
+        await _cleanup_delivery_failure(
             settings,
+            None,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -178,9 +214,9 @@ async def _handle_installation_style_webhook(
             detail=str(exc),
         ) from exc
     except OperationalError as exc:
-        await run_in_threadpool(
-            release_github_webhook_delivery,
+        await _cleanup_delivery_failure(
             settings,
+            None,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -311,9 +347,9 @@ async def github_webhook(request: Request) -> Response:
             payload_obj,
         )
     except OperationalError as exc:
-        await run_in_threadpool(
-            release_github_webhook_delivery,
+        await _cleanup_delivery_failure(
             settings,
+            payload_obj,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -345,9 +381,9 @@ async def github_webhook(request: Request) -> Response:
             delivery_id=delivery_id,
         )
     except ValueError as exc:
-        await run_in_threadpool(
-            release_github_webhook_delivery,
+        await _cleanup_delivery_failure(
             settings,
+            payload_obj,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -356,9 +392,9 @@ async def github_webhook(request: Request) -> Response:
             detail=str(exc),
         ) from exc
     except redis.exceptions.RedisError as exc:
-        await run_in_threadpool(
-            release_github_webhook_delivery,
+        await _cleanup_delivery_failure(
             settings,
+            payload_obj,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -389,15 +425,9 @@ async def github_webhook(request: Request) -> Response:
             payload_obj,
         )
     except OperationalError as exc:
-        await run_in_threadpool(
-            release_synchronize_debounce,
+        await _cleanup_delivery_failure(
             settings,
             payload_obj,
-            delivery_id=delivery_id,
-        )
-        await run_in_threadpool(
-            release_github_webhook_delivery,
-            settings,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )
@@ -448,15 +478,9 @@ async def github_webhook(request: Request) -> Response:
 
         run_pr_analysis_stub.send(envelope)
     except Exception:
-        await run_in_threadpool(
-            release_synchronize_debounce,
+        await _cleanup_delivery_failure(
             settings,
             payload_obj,
-            delivery_id=delivery_id,
-        )
-        await run_in_threadpool(
-            release_github_webhook_delivery,
-            settings,
             delivery_id=delivery_id,
             claim_token=claim_token,
         )

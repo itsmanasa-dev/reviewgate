@@ -5,12 +5,16 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+import redis.exceptions
 
 from reviewgate.app.analysis.synchronize_debounce import (
+    _RELEASE_IF_MATCH_LUA,
     parse_pull_request_repo_and_number,
-    synchronize_debounce_key,
+    release_synchronize_debounce,
     synchronize_debounce_allows_enqueue,
+    synchronize_debounce_key,
     try_claim_synchronize_debounce,
+    try_release_synchronize_debounce,
 )
 from reviewgate.app.settings import AppSettings
 
@@ -32,6 +36,7 @@ def test_try_claim_synchronize_debounce_respects_redis_set_nx() -> None:
         owner="o",
         repo="r",
         pull_number=1,
+        delivery_id="deliv-1",
     )
     redis_mock.set.assert_called_once()
     assert redis_mock.set.call_args.kwargs["nx"] is True
@@ -41,6 +46,7 @@ def test_try_claim_synchronize_debounce_respects_redis_set_nx() -> None:
         repo="r",
         pull_number=1,
     )
+    assert redis_mock.set.call_args[0][1] == "deliv-1"
 
     redis_mock.set.return_value = None
     assert not try_claim_synchronize_debounce(
@@ -49,6 +55,32 @@ def test_try_claim_synchronize_debounce_respects_redis_set_nx() -> None:
         repo="r",
         pull_number=1,
     )
+
+
+def test_try_release_synchronize_debounce_atomic_eval() -> None:
+    """Atomic compare-and-delete invokes Lua script with matching delivery id."""
+
+    redis_mock = MagicMock()
+    redis_mock.eval.return_value = 1
+    key = synchronize_debounce_key(owner="o", repo="r", pull_number=1)
+
+    assert try_release_synchronize_debounce(
+        redis_mock,
+        owner="o",
+        repo="r",
+        pull_number=1,
+        delivery_id="deliv-mine",
+    ) is True
+    redis_mock.eval.assert_called_once_with(_RELEASE_IF_MATCH_LUA, 1, key, "deliv-mine")
+
+    redis_mock.eval.return_value = 0
+    assert try_release_synchronize_debounce(
+        redis_mock,
+        owner="o",
+        repo="r",
+        pull_number=1,
+        delivery_id="deliv-other",
+    ) is False
 
 
 def test_parse_pull_request_repo_and_number_success() -> None:
@@ -119,5 +151,90 @@ def test_synchronize_debounce_allows_enqueue_uses_connect_redis(
         lambda _s: redis_mock,
     )
 
-    assert synchronize_debounce_allows_enqueue(settings, payload) is True
+    assert synchronize_debounce_allows_enqueue(settings, payload, delivery_id="d3") is True
+    redis_mock.close.assert_called_once()
+
+
+def test_release_synchronize_debounce_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """release_synchronize_debounce atomically releases reservation when matching."""
+
+    settings = AppSettings(redis_url="redis://127.0.0.1:6379/0")
+    payload = {
+        "action": "synchronize",
+        "number": 3,
+        "repository": {"name": "r", "owner": {"login": "o"}},
+    }
+
+    redis_mock = MagicMock()
+    redis_mock.eval.return_value = 1
+    redis_mock.close = MagicMock()
+
+    monkeypatch.setattr(
+        "reviewgate.app.analysis.synchronize_debounce.connect_redis",
+        lambda _s: redis_mock,
+    )
+
+    assert release_synchronize_debounce(settings, payload, delivery_id="deliv-match") is True
+    redis_mock.eval.assert_called_once()
+    redis_mock.close.assert_called_once()
+
+
+def test_release_synchronize_debounce_does_not_delete_other_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release_synchronize_debounce returns False when key has a different delivery ID."""
+
+    settings = AppSettings(redis_url="redis://127.0.0.1:6379/0")
+    payload = {
+        "action": "synchronize",
+        "number": 3,
+        "repository": {"name": "r", "owner": {"login": "o"}},
+    }
+
+    redis_mock = MagicMock()
+    redis_mock.eval.return_value = 0
+    redis_mock.close = MagicMock()
+
+    monkeypatch.setattr(
+        "reviewgate.app.analysis.synchronize_debounce.connect_redis",
+        lambda _s: redis_mock,
+    )
+
+    assert release_synchronize_debounce(settings, payload, delivery_id="deliv-mismatch") is False
+    redis_mock.eval.assert_called_once()
+    redis_mock.close.assert_called_once()
+
+
+def test_release_synchronize_debounce_non_synchronize_skips_redis() -> None:
+    """release_synchronize_debounce skips Redis when action is not synchronize."""
+
+    settings = AppSettings(redis_url="redis://127.0.0.1:6379/0")
+    payload = {"action": "opened", "number": 1}
+    assert release_synchronize_debounce(settings, payload, delivery_id="d1") is False
+
+
+def test_release_synchronize_debounce_redis_error_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release_synchronize_debounce raises RedisError when Redis fails."""
+
+    settings = AppSettings(redis_url="redis://127.0.0.1:6379/0")
+    payload = {
+        "action": "synchronize",
+        "number": 3,
+        "repository": {"name": "r", "owner": {"login": "o"}},
+    }
+
+    redis_mock = MagicMock()
+    redis_mock.eval.side_effect = redis.exceptions.ConnectionError("Redis unreachable")
+    redis_mock.close = MagicMock()
+
+    monkeypatch.setattr(
+        "reviewgate.app.analysis.synchronize_debounce.connect_redis",
+        lambda _s: redis_mock,
+    )
+
+    with pytest.raises(redis.exceptions.RedisError):
+        release_synchronize_debounce(settings, payload, delivery_id="d1")
+
     redis_mock.close.assert_called_once()

@@ -18,6 +18,15 @@ from reviewgate.app.settings import AppSettings
 _DEBOUNCE_TTL_SECONDS: Final[int] = 30
 
 
+_RELEASE_IF_MATCH_LUA: Final[str] = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+"""
+
+
 class _RedisSetNX(Protocol):
     """Minimal Redis surface used for ``SET ... NX EX``."""
 
@@ -90,6 +99,24 @@ def try_claim_synchronize_debounce(
     return bool(redis_client.set(key, delivery_id, nx=True, ex=_DEBOUNCE_TTL_SECONDS))
 
 
+def try_release_synchronize_debounce(
+    redis_client: Any,
+    *,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    delivery_id: str,
+) -> bool:
+    """Atomically delete the debounce key only if its current value equals ``delivery_id``."""
+
+    key = synchronize_debounce_key(
+        owner=owner,
+        repo=repo,
+        pull_number=pull_number,
+    )
+    return bool(redis_client.eval(_RELEASE_IF_MATCH_LUA, 1, key, delivery_id))
+
+
 def synchronize_debounce_allows_enqueue(
     settings: AppSettings,
     payload: dict[str, Any],
@@ -125,30 +152,37 @@ def release_synchronize_debounce(
     payload: dict[str, Any],
     *,
     delivery_id: str,
-) -> None:
-    """Release synchronize debounce slot if it was reserved by this delivery."""
+) -> bool:
+    """Atomically release synchronize debounce slot if it was reserved by this delivery.
+
+    Returns ``True`` when the matching key was deleted, or ``False`` when the slot
+    was not reserved by this delivery, payload was not a synchronize event, or Redis
+    is unconfigured.
+
+    Raises:
+        redis.exceptions.RedisError: When Redis communication or Lua evaluation fails.
+    """
 
     action = payload.get("action")
     if action != "synchronize":
-        return
+        return False
 
     try:
         owner, repo, pull_number = parse_pull_request_repo_and_number(payload)
     except ValueError:
-        return
+        return False
 
     client = connect_redis(settings)
     if client is None:
-        return
+        return False
 
     try:
-        key = synchronize_debounce_key(owner=owner, repo=repo, pull_number=pull_number)
-        current_val = client.get(key)
-        if current_val is not None:
-            decoded = current_val.decode("utf-8") if isinstance(current_val, bytes) else str(current_val)
-            if decoded == delivery_id:
-                client.delete(key)
-    except Exception:
-        pass
+        return try_release_synchronize_debounce(
+            client,
+            owner=owner,
+            repo=repo,
+            pull_number=pull_number,
+            delivery_id=delivery_id,
+        )
     finally:
         client.close()

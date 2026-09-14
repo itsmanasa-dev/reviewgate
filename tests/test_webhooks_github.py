@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import uuid
 from typing import Literal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1408,3 +1408,174 @@ def test_github_webhook_installation_created_marks_delivery_processed(
     send.assert_not_called()
     mock_mark.assert_called_once()
     assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-inst-created-1"
+
+
+def test_github_webhook_redis_set_nx_failure_cleans_up_debounce_and_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154 / Copilot: Redis SET NX failure triggers debounce and claim cleanup."""
+
+    import redis.exceptions
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "synchronize_debounce_allows_enqueue",
+            side_effect=redis.exceptions.ConnectionError("Redis connection dropped on SET NX"),
+        ):
+            with patch.object(
+                github_webhook_module,
+                "release_synchronize_debounce",
+            ) as mock_release_debounce:
+                with patch.object(
+                    github_webhook_module,
+                    "release_github_webhook_delivery",
+                ) as mock_release_claim:
+                    with TestClient(create_app()) as client:
+                        response = client.post(
+                            "/webhooks/github",
+                            content=body,
+                            headers={
+                                "x-hub-signature-256": _signature(body, secret),
+                                "x-github-delivery": "delivery-set-nx-fail",
+                                "x-github-event": "pull_request",
+                            },
+                        )
+
+    assert response.status_code == 503
+    mock_release_debounce.assert_called_once()
+    assert mock_release_debounce.call_args.kwargs["delivery_id"] == "delivery-set-nx-fail"
+    mock_release_claim.assert_called_once()
+    assert mock_release_claim.call_args.kwargs["delivery_id"] == "delivery-set-nx-fail"
+    assert mock_release_claim.call_args.kwargs["claim_token"] == token
+
+
+def test_github_webhook_cleanup_ordering_and_debounce_failure_resilience(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154 / Copilot: Debounce cleanup happens before claim cleanup, and claim cleanup still runs if debounce cleanup raises."""
+
+    import redis.exceptions
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    calls: list[str] = []
+
+    def _failing_debounce_release(*_a: object, **_k: object) -> bool:
+        calls.append("release_debounce")
+        raise redis.exceptions.ConnectionError("Redis failed during cleanup")
+
+    def _claim_release(*_a: object, **_k: object) -> None:
+        calls.append("release_claim")
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "synchronize_debounce_allows_enqueue",
+            return_value=True,
+        ):
+            with patch(
+                "reviewgate.app.analysis.broker_install.RedisBroker",
+                lambda **_: StubBroker(),
+            ):
+                with patch(
+                    "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+                    side_effect=RuntimeError("send failed"),
+                ):
+                    with patch.object(
+                        github_webhook_module,
+                        "release_synchronize_debounce",
+                        side_effect=_failing_debounce_release,
+                    ):
+                        with patch.object(
+                            github_webhook_module,
+                            "release_github_webhook_delivery",
+                            side_effect=_claim_release,
+                        ) as mock_release_claim:
+                            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                                response = client.post(
+                                    "/webhooks/github",
+                                    content=body,
+                                    headers={
+                                        "x-hub-signature-256": _signature(body, secret),
+                                        "x-github-delivery": "delivery-order-fail",
+                                        "x-github-event": "pull_request",
+                                    },
+                                )
+
+    assert response.status_code == 500
+    assert calls == ["release_debounce", "release_claim"]
+    mock_release_claim.assert_called_once()
+    assert mock_release_claim.call_args.kwargs["delivery_id"] == "delivery-order-fail"
+    assert mock_release_claim.call_args.kwargs["claim_token"] == token
+
+
+def test_github_webhook_actor_import_failure_cleans_up_debounce_and_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154 / Copilot: Actor import failure triggers debounce and claim cleanup."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "synchronize_debounce_allows_enqueue",
+            return_value=True,
+        ):
+            with patch(
+                "reviewgate.app.analysis.broker_install.RedisBroker",
+                lambda **_: StubBroker(),
+            ):
+                with patch.object(
+                    github_webhook_module,
+                    "release_synchronize_debounce",
+                ) as mock_release_debounce:
+                    with patch.object(
+                        github_webhook_module,
+                        "release_github_webhook_delivery",
+                    ) as mock_release_claim:
+                        with patch.dict("sys.modules", {"reviewgate.app.analysis.jobs": None}):
+                            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                                response = client.post(
+                                    "/webhooks/github",
+                                    content=body,
+                                    headers={
+                                        "x-hub-signature-256": _signature(body, secret),
+                                        "x-github-delivery": "delivery-import-fail",
+                                        "x-github-event": "pull_request",
+                                    },
+                                )
+
+    assert response.status_code == 500
+    mock_release_debounce.assert_called_once()
+    assert mock_release_debounce.call_args.kwargs["delivery_id"] == "delivery-import-fail"
+    mock_release_claim.assert_called_once()
+    assert mock_release_claim.call_args.kwargs["delivery_id"] == "delivery-import-fail"
+    assert mock_release_claim.call_args.kwargs["claim_token"] == token
