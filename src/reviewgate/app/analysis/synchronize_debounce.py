@@ -78,6 +78,7 @@ def try_claim_synchronize_debounce(
     owner: str,
     repo: str,
     pull_number: int,
+    delivery_id: str = "1",
 ) -> bool:
     """Atomically reserve the debounce slot; return ``True`` when enqueue may proceed."""
 
@@ -86,12 +87,14 @@ def try_claim_synchronize_debounce(
         repo=repo,
         pull_number=pull_number,
     )
-    return bool(redis_client.set(key, "1", nx=True, ex=_DEBOUNCE_TTL_SECONDS))
+    return bool(redis_client.set(key, delivery_id, nx=True, ex=_DEBOUNCE_TTL_SECONDS))
 
 
 def synchronize_debounce_allows_enqueue(
     settings: AppSettings,
     payload: dict[str, Any],
+    *,
+    delivery_id: str = "1",
 ) -> bool:
     """Return ``False`` when a synchronize event should be coalesced (issue #45)."""
 
@@ -111,6 +114,41 @@ def synchronize_debounce_allows_enqueue(
             owner=owner,
             repo=repo,
             pull_number=pull_number,
+            delivery_id=delivery_id,
         )
+    finally:
+        client.close()
+
+
+def release_synchronize_debounce(
+    settings: AppSettings,
+    payload: dict[str, Any],
+    *,
+    delivery_id: str,
+) -> None:
+    """Release synchronize debounce slot if it was reserved by this delivery."""
+
+    action = payload.get("action")
+    if action != "synchronize":
+        return
+
+    try:
+        owner, repo, pull_number = parse_pull_request_repo_and_number(payload)
+    except ValueError:
+        return
+
+    client = connect_redis(settings)
+    if client is None:
+        return
+
+    try:
+        key = synchronize_debounce_key(owner=owner, repo=repo, pull_number=pull_number)
+        current_val = client.get(key)
+        if current_val is not None:
+            decoded = current_val.decode("utf-8") if isinstance(current_val, bytes) else str(current_val)
+            if decoded == delivery_id:
+                client.delete(key)
+    except Exception:
+        pass
     finally:
         client.close()

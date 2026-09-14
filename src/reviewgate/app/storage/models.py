@@ -374,6 +374,10 @@ class WebhookDelivery(Base):
         nullable=False,
         server_default=text("now()"),
     )
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

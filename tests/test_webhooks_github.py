@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import uuid
 from typing import Literal
 from unittest.mock import AsyncMock, patch
 
@@ -46,8 +47,8 @@ def _stub_github_webhook_delivery_claim(monkeypatch: pytest.MonkeyPatch) -> None
         *,
         delivery_id: str,
         event_name: str,
-    ) -> Literal["claimed"]:
-        return "claimed"
+    ) -> tuple[Literal["claimed"], uuid.UUID]:
+        return ("claimed", uuid.uuid4())
 
     monkeypatch.setattr(
         github_webhook_module,
@@ -563,9 +564,10 @@ def test_github_webhook_database_unavailable_returns_503(
     monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", "s")
     monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
     body = _PR_OPENED_BODY
-    with patch(
-        "reviewgate.app.webhooks.github.run_in_threadpool",
-        new=AsyncMock(return_value="database_unavailable"),
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("database_unavailable", None),
     ):
         with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
             with TestClient(create_app()) as client:
@@ -590,9 +592,10 @@ def test_github_webhook_duplicate_delivery_returns_202_without_enqueue(
     monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", "s")
     monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
     body = _PR_OPENED_BODY
-    with patch(
-        "reviewgate.app.webhooks.github.run_in_threadpool",
-        new=AsyncMock(return_value="duplicate"),
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("duplicate", None),
     ):
         with patch(
             "reviewgate.app.analysis.broker_install.RedisBroker",
@@ -947,11 +950,12 @@ def test_github_webhook_unprocessed_delivery_retry_enqueues_successfully(
     monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
     body = _PR_OPENED_BODY
 
-    # Simulate claim_github_webhook_delivery returning "claimed" on retry of unprocessed delivery
+    # Simulate claim_github_webhook_delivery returning ("claimed", token) on retry of unprocessed delivery
+    token = uuid.uuid4()
     with patch.object(
         github_webhook_module,
         "claim_github_webhook_delivery",
-        return_value="claimed",
+        return_value=("claimed", token),
     ) as mock_claim:
         with patch.object(
             github_webhook_module,
@@ -980,6 +984,7 @@ def test_github_webhook_unprocessed_delivery_retry_enqueues_successfully(
     send.assert_called_once()
     mock_mark.assert_called_once()
     assert mock_mark.call_args.kwargs["delivery_id"] == "delivery-retry-ok"
+    assert mock_mark.call_args.kwargs["claim_token"] == token
 
 
 def test_github_webhook_processed_delivery_is_treated_as_duplicate(
@@ -992,11 +997,11 @@ def test_github_webhook_processed_delivery_is_treated_as_duplicate(
     monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
     body = _PR_OPENED_BODY
 
-    # Simulate claim_github_webhook_delivery returning "duplicate" because delivery is already processed
+    # Simulate claim_github_webhook_delivery returning ("duplicate", None) because delivery is already processed
     with patch.object(
         github_webhook_module,
         "claim_github_webhook_delivery",
-        return_value="duplicate",
+        return_value=("duplicate", None),
     ) as mock_claim:
         with patch.object(
             github_webhook_module,
@@ -1020,6 +1025,203 @@ def test_github_webhook_processed_delivery_is_treated_as_duplicate(
     mock_claim.assert_called_once()
     send.assert_not_called()
     mock_mark.assert_not_called()
+
+
+def test_github_webhook_active_claim_returns_retryable_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: An active in-progress delivery claim returns 503 so GitHub retries."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("active", None),
+    ) as mock_claim:
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+        ) as mock_mark:
+            with patch("reviewgate.app.analysis.jobs.run_pr_analysis_stub.send") as send:
+                with TestClient(create_app()) as client:
+                    response = client.post(
+                        "/webhooks/github",
+                        content=body,
+                        headers={
+                            "x-hub-signature-256": _signature(body, secret),
+                            "x-github-delivery": "delivery-active-inflight",
+                            "x-github-event": "pull_request",
+                        },
+                    )
+
+    assert response.status_code == 503
+    mock_claim.assert_called_once()
+    send.assert_not_called()
+    mock_mark.assert_not_called()
+
+
+def test_github_webhook_broker_install_failure_cleans_up_debounce_and_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Failure in broker install releases debounce and delivery claim."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "synchronize_debounce_allows_enqueue",
+            return_value=True,
+        ):
+            with patch.object(
+                github_webhook_module,
+                "install_redis_broker",
+                side_effect=RuntimeError("broker failure"),
+            ):
+                with patch.object(
+                    github_webhook_module,
+                    "release_synchronize_debounce",
+                ) as mock_release_debounce:
+                    with patch.object(
+                        github_webhook_module,
+                        "release_github_webhook_delivery",
+                    ) as mock_release_claim:
+                        with TestClient(create_app(), raise_server_exceptions=False) as client:
+                            response = client.post(
+                                "/webhooks/github",
+                                content=body,
+                                headers={
+                                    "x-hub-signature-256": _signature(body, secret),
+                                    "x-github-delivery": "delivery-broker-fail",
+                                    "x-github-event": "pull_request",
+                                },
+                            )
+
+    assert response.status_code == 500
+    mock_release_debounce.assert_called_once()
+    assert mock_release_debounce.call_args.kwargs["delivery_id"] == "delivery-broker-fail"
+    mock_release_claim.assert_called_once()
+    assert mock_release_claim.call_args.kwargs["delivery_id"] == "delivery-broker-fail"
+    assert mock_release_claim.call_args.kwargs["claim_token"] == token
+
+
+def test_github_webhook_enqueue_failure_cleans_up_debounce_and_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: Failure in job send releases debounce and delivery claim."""
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_SYNCHRONIZE_BODY
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "synchronize_debounce_allows_enqueue",
+            return_value=True,
+        ):
+            with patch(
+                "reviewgate.app.analysis.broker_install.RedisBroker",
+                lambda **_: StubBroker(),
+            ):
+                with patch(
+                    "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+                    side_effect=RuntimeError("queue down"),
+                ):
+                    with patch.object(
+                        github_webhook_module,
+                        "release_synchronize_debounce",
+                    ) as mock_release_debounce:
+                        with patch.object(
+                            github_webhook_module,
+                            "release_github_webhook_delivery",
+                        ) as mock_release_claim:
+                            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                                response = client.post(
+                                    "/webhooks/github",
+                                    content=body,
+                                    headers={
+                                        "x-hub-signature-256": _signature(body, secret),
+                                        "x-github-delivery": "delivery-enqueue-fail-2",
+                                        "x-github-event": "pull_request",
+                                    },
+                                )
+
+    assert response.status_code == 500
+    mock_release_debounce.assert_called_once()
+    assert mock_release_debounce.call_args.kwargs["delivery_id"] == "delivery-enqueue-fail-2"
+    mock_release_claim.assert_called_once()
+    assert mock_release_claim.call_args.kwargs["delivery_id"] == "delivery-enqueue-fail-2"
+    assert mock_release_claim.call_args.kwargs["claim_token"] == token
+
+
+def test_github_webhook_send_success_mark_processed_failure_does_not_release_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #154: If send succeeds but mark_processed fails, claim is NOT released (prevents duplicate enqueue)."""
+
+    from sqlalchemy.exc import OperationalError
+
+    secret = "whsec"
+    monkeypatch.setenv("REVIEWGATE_GITHUB_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    body = _PR_OPENED_BODY
+
+    token = uuid.uuid4()
+    with patch.object(
+        github_webhook_module,
+        "claim_github_webhook_delivery",
+        return_value=("claimed", token),
+    ):
+        with patch.object(
+            github_webhook_module,
+            "mark_github_webhook_delivery_processed",
+            side_effect=OperationalError("db connection lost", {}, Exception()),
+        ):
+            with patch.object(
+                github_webhook_module,
+                "release_github_webhook_delivery",
+            ) as mock_release:
+                with patch(
+                    "reviewgate.app.analysis.broker_install.RedisBroker",
+                    lambda **_: StubBroker(),
+                ):
+                    with patch(
+                        "reviewgate.app.analysis.jobs.run_pr_analysis_stub.send",
+                    ) as send:
+                        with TestClient(create_app()) as client:
+                            response = client.post(
+                                "/webhooks/github",
+                                content=body,
+                                headers={
+                                    "x-hub-signature-256": _signature(body, secret),
+                                    "x-github-delivery": "delivery-mark-fail",
+                                    "x-github-event": "pull_request",
+                                },
+                            )
+
+    assert response.status_code == 503
+    send.assert_called_once()
+    mock_release.assert_not_called()
+
 
 
 def test_github_webhook_mark_processed_database_unavailable_returns_503(

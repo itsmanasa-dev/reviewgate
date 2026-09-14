@@ -33,6 +33,7 @@ from starlette.concurrency import run_in_threadpool
 
 from reviewgate.app.analysis.broker_install import install_redis_broker
 from reviewgate.app.analysis.synchronize_debounce import (
+    release_synchronize_debounce,
     synchronize_debounce_allows_enqueue,
 )
 from reviewgate.app.settings import AppSettings
@@ -67,17 +68,19 @@ def _verify_signature_sha256(
     signature_header: str | None,
     secret: SecretStr,
 ) -> bool:
-    """Return ``True`` when ``X-Hub-Signature-256`` matches the raw body."""
+    """Validate GitHub HMAC-SHA256 signature against raw payload."""
 
-    if signature_header is None or not signature_header.startswith(_SHA256_PREFIX):
+    if signature_header is None:
         return False
-    digest = hmac.new(
-        secret.get_secret_value().encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-    expected = f"{_SHA256_PREFIX}{digest}"
-    return hmac.compare_digest(signature_header, expected)
+
+    sig_prefix = _SHA256_PREFIX
+    if not signature_header.startswith(sig_prefix):
+        return False
+
+    expected_hex = signature_header[len(sig_prefix) :]
+    key_bytes = secret.get_secret_value().encode("utf-8")
+    computed = hmac.new(key_bytes, body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed, expected_hex)
 
 
 async def _handle_installation_style_webhook(
@@ -87,23 +90,22 @@ async def _handle_installation_style_webhook(
     delivery_id: str,
     event_name: str,
 ) -> Response:
-    """Persist supported ``installation`` / ``installation_repositories`` payloads."""
+    """Handle ``installation`` and ``installation_repositories`` payloads (issues #35, #36)."""
 
     try:
-        payload_obj: object = json.loads(body.decode("utf-8"))
+        payload: object = json.loads(body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail="installation webhook body must be JSON",
+            detail=f"{event_name} webhook body must be JSON",
         ) from exc
 
-    if not isinstance(payload_obj, dict):
+    if not isinstance(payload, dict):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail="installation webhook body must be a JSON object",
+            detail=f"{event_name} webhook body must be a JSON object",
         )
 
-    payload: dict[str, Any] = payload_obj
     action = payload.get("action")
     if not isinstance(action, str):
         raise HTTPException(
@@ -137,7 +139,7 @@ async def _handle_installation_style_webhook(
             detail="Database URL is required for installation webhook processing",
         )
 
-    claim_result = await run_in_threadpool(
+    claim_result, claim_token = await run_in_threadpool(
         claim_github_webhook_delivery,
         settings,
         delivery_id=delivery_id,
@@ -145,6 +147,11 @@ async def _handle_installation_style_webhook(
     )
     if claim_result == "duplicate":
         return Response(status_code=status.HTTP_202_ACCEPTED)
+    if claim_result == "active":
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook delivery is currently being processed by another worker",
+        )
     if claim_result == "database_unavailable":
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -164,6 +171,7 @@ async def _handle_installation_style_webhook(
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -174,6 +182,7 @@ async def _handle_installation_style_webhook(
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -185,6 +194,7 @@ async def _handle_installation_style_webhook(
             mark_github_webhook_delivery_processed,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
     except OperationalError as exc:
         raise HTTPException(
@@ -275,7 +285,7 @@ async def github_webhook(request: Request) -> Response:
             detail="Database URL is required for pull_request webhook processing",
         )
 
-    claim_result = await run_in_threadpool(
+    claim_result, claim_token = await run_in_threadpool(
         claim_github_webhook_delivery,
         settings,
         delivery_id=delivery_id,
@@ -283,6 +293,11 @@ async def github_webhook(request: Request) -> Response:
     )
     if claim_result == "duplicate":
         return Response(status_code=status.HTTP_202_ACCEPTED)
+    if claim_result == "active":
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook delivery is currently being processed by another worker",
+        )
     if claim_result == "database_unavailable":
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -300,6 +315,7 @@ async def github_webhook(request: Request) -> Response:
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -312,6 +328,7 @@ async def github_webhook(request: Request) -> Response:
                 mark_github_webhook_delivery_processed,
                 settings,
                 delivery_id=delivery_id,
+                claim_token=claim_token,
             )
         except OperationalError as exc:
             raise HTTPException(
@@ -325,12 +342,14 @@ async def github_webhook(request: Request) -> Response:
             synchronize_debounce_allows_enqueue,
             settings,
             payload_obj,
+            delivery_id=delivery_id,
         )
     except ValueError as exc:
         await run_in_threadpool(
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -341,6 +360,7 @@ async def github_webhook(request: Request) -> Response:
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -353,6 +373,7 @@ async def github_webhook(request: Request) -> Response:
                 mark_github_webhook_delivery_processed,
                 settings,
                 delivery_id=delivery_id,
+                claim_token=claim_token,
             )
         except OperationalError as exc:
             raise HTTPException(
@@ -369,9 +390,16 @@ async def github_webhook(request: Request) -> Response:
         )
     except OperationalError as exc:
         await run_in_threadpool(
+            release_synchronize_debounce,
+            settings,
+            payload_obj,
+            delivery_id=delivery_id,
+        )
+        await run_in_threadpool(
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -384,6 +412,7 @@ async def github_webhook(request: Request) -> Response:
                 mark_github_webhook_delivery_processed,
                 settings,
                 delivery_id=delivery_id,
+                claim_token=claim_token,
             )
         except OperationalError as exc:
             raise HTTPException(
@@ -391,10 +420,6 @@ async def github_webhook(request: Request) -> Response:
                 detail="Temporary database error while recording webhook delivery",
             ) from exc
         return Response(status_code=status.HTTP_202_ACCEPTED)
-
-    install_redis_broker(settings)
-
-    from reviewgate.app.analysis.jobs import run_pr_analysis_stub
 
     envelope: dict[str, object] = {
         "github_delivery_id": delivery_id,
@@ -418,12 +443,22 @@ async def github_webhook(request: Request) -> Response:
     envelope.update(reviewgate_fields)
 
     try:
+        install_redis_broker(settings)
+        from reviewgate.app.analysis.jobs import run_pr_analysis_stub
+
         run_pr_analysis_stub.send(envelope)
     except Exception:
+        await run_in_threadpool(
+            release_synchronize_debounce,
+            settings,
+            payload_obj,
+            delivery_id=delivery_id,
+        )
         await run_in_threadpool(
             release_github_webhook_delivery,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
         raise
 
@@ -432,6 +467,7 @@ async def github_webhook(request: Request) -> Response:
             mark_github_webhook_delivery_processed,
             settings,
             delivery_id=delivery_id,
+            claim_token=claim_token,
         )
     except OperationalError as exc:
         raise HTTPException(

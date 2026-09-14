@@ -376,7 +376,7 @@ def test_webhook_pull_request_synchronize_enqueues_when_debounce_allows(
     monkeypatch.setattr(
         github_webhook_module,
         "claim_github_webhook_delivery",
-        lambda *_a, **_k: "claimed",
+        lambda *_a, **_k: ("claimed", uuid.uuid4()),
     )
     monkeypatch.setattr(
         github_webhook_module,
