@@ -69,19 +69,17 @@ def _verify_signature_sha256(
     signature_header: str | None,
     secret: SecretStr,
 ) -> bool:
-    """Validate GitHub HMAC-SHA256 signature against raw payload."""
+    """Return ``True`` when ``X-Hub-Signature-256`` matches the raw body."""
 
-    if signature_header is None:
+    if signature_header is None or not signature_header.startswith(_SHA256_PREFIX):
         return False
-
-    sig_prefix = _SHA256_PREFIX
-    if not signature_header.startswith(sig_prefix):
-        return False
-
-    expected_hex = signature_header[len(sig_prefix) :]
-    key_bytes = secret.get_secret_value().encode("utf-8")
-    computed = hmac.new(key_bytes, body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed, expected_hex)
+    digest = hmac.new(
+        secret.get_secret_value().encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    expected = f"{_SHA256_PREFIX}{digest}"
+    return hmac.compare_digest(signature_header, expected)
 
 
 async def _cleanup_delivery_failure(
@@ -94,7 +92,10 @@ async def _cleanup_delivery_failure(
     """Safely cleanup debounce reservation first, then database delivery claim.
 
     Ensures the delivery-owned debounce reservation is released before releasing
-    the PostgreSQL claim. If either cleanup step fails, the other is still attempted.
+    the PostgreSQL claim. If debounce cleanup fails (e.g. Redis error), the
+    PostgreSQL claim is intentionally NOT released so that it remains active
+    until the lease expires, preventing an immediate retry from reaching a stale
+    debounce slot.
     """
 
     if payload_obj is not None:
@@ -106,7 +107,8 @@ async def _cleanup_delivery_failure(
                 delivery_id=delivery_id,
             )
         except Exception:
-            pass
+            # Debounce cleanup failed; do NOT release the PostgreSQL claim.
+            return
 
     try:
         await run_in_threadpool(

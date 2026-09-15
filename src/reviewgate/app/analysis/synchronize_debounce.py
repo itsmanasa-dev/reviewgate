@@ -28,7 +28,7 @@ end
 
 
 class _RedisSetNX(Protocol):
-    """Minimal Redis surface used for ``SET ... NX EX``."""
+    """Minimal Redis surface used for ``SET ... NX EX`` and ``GET``."""
 
     def set(
         self,
@@ -38,6 +38,9 @@ class _RedisSetNX(Protocol):
         nx: bool = False,
         ex: int | None = None,
     ) -> bool | None:
+        ...
+
+    def get(self, name: str) -> str | bytes | None:
         ...
 
 
@@ -89,14 +92,27 @@ def try_claim_synchronize_debounce(
     pull_number: int,
     delivery_id: str = "1",
 ) -> bool:
-    """Atomically reserve the debounce slot; return ``True`` when enqueue may proceed."""
+    """Atomically reserve the debounce slot; return ``True`` when enqueue may proceed.
+
+    If the slot is already occupied, checks whether the current slot value equals
+    ``delivery_id``. If it matches, this request is an owner retry for the same delivery
+    and enqueue is allowed to proceed. If a different delivery occupies the slot,
+    returns ``False`` so the delivery is coalesced.
+    """
 
     key = synchronize_debounce_key(
         owner=owner,
         repo=repo,
         pull_number=pull_number,
     )
-    return bool(redis_client.set(key, delivery_id, nx=True, ex=_DEBOUNCE_TTL_SECONDS))
+    if bool(redis_client.set(key, delivery_id, nx=True, ex=_DEBOUNCE_TTL_SECONDS)):
+        return True
+
+    existing = redis_client.get(key)
+    if isinstance(existing, bytes):
+        existing = existing.decode("utf-8", errors="replace")
+
+    return bool(existing is not None and existing == delivery_id)
 
 
 def try_release_synchronize_debounce(

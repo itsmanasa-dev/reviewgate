@@ -27,7 +27,7 @@ def test_synchronize_debounce_key_normalizes_case() -> None:
 
 
 def test_try_claim_synchronize_debounce_respects_redis_set_nx() -> None:
-    """First ``SET … NX`` wins; a falsy driver response means coalesced."""
+    """First ``SET … NX`` wins; a falsy response checks existing value."""
 
     redis_mock = MagicMock()
     redis_mock.set.return_value = True
@@ -48,13 +48,67 @@ def test_try_claim_synchronize_debounce_respects_redis_set_nx() -> None:
     )
     assert redis_mock.set.call_args[0][1] == "deliv-1"
 
+    # When SET NX returns False and GET returns a different delivery, it is coalesced (False)
     redis_mock.set.return_value = None
+    redis_mock.get.return_value = "deliv-other"
     assert not try_claim_synchronize_debounce(
         redis_mock,
         owner="o",
         repo="r",
         pull_number=1,
+        delivery_id="deliv-1",
     )
+
+
+def test_try_claim_synchronize_debounce_owner_retry() -> None:
+    """When SET NX returns False but GET returns the same delivery ID, treat as owner retry."""
+
+    redis_mock = MagicMock()
+    redis_mock.set.return_value = None
+    redis_mock.get.return_value = "deliv-same"
+
+    assert try_claim_synchronize_debounce(
+        redis_mock,
+        owner="o",
+        repo="r",
+        pull_number=1,
+        delivery_id="deliv-same",
+    ) is True
+    redis_mock.get.assert_called_once_with(
+        synchronize_debounce_key(owner="o", repo="r", pull_number=1),
+    )
+
+
+def test_try_claim_synchronize_debounce_owner_retry_bytes() -> None:
+    """Owner retry comparison handles bytes response from Redis driver."""
+
+    redis_mock = MagicMock()
+    redis_mock.set.return_value = None
+    redis_mock.get.return_value = b"deliv-bytes"
+
+    assert try_claim_synchronize_debounce(
+        redis_mock,
+        owner="o",
+        repo="r",
+        pull_number=1,
+        delivery_id="deliv-bytes",
+    ) is True
+
+
+def test_try_claim_synchronize_debounce_expired_slot_returns_false() -> None:
+    """When SET NX returns False and GET returns None (key expired between calls), returns False."""
+
+    redis_mock = MagicMock()
+    redis_mock.set.return_value = None
+    redis_mock.get.return_value = None
+
+    assert try_claim_synchronize_debounce(
+        redis_mock,
+        owner="o",
+        repo="r",
+        pull_number=1,
+        delivery_id="deliv-1",
+    ) is False
 
 
 def test_try_release_synchronize_debounce_atomic_eval() -> None:

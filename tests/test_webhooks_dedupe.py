@@ -56,6 +56,8 @@ def test_claim_github_webhook_delivery_new_row_claimed(
     app_settings: AppSettings,
 ) -> None:
     """1. New delivery is atomically inserted and returns ('claimed', token)."""
+    from sqlalchemy.dialects import postgresql
+
     fake_engine = object()
     session = MagicMock()
     first_result = MagicMock()
@@ -80,6 +82,19 @@ def test_claim_github_webhook_delivery_new_row_claimed(
     assert status == "claimed"
     assert isinstance(token, uuid.UUID)
     session.execute.assert_called_once()
+    executed_stmt = session.execute.call_args[0][0]
+    compiled_sql = str(
+        executed_stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "INSERT INTO webhook_deliveries" in compiled_sql
+    assert "ON CONFLICT (github_delivery_id) DO UPDATE" in compiled_sql
+    assert "webhook_deliveries.processed IS false" in compiled_sql
+    assert "webhook_deliveries.claimed_at <" in compiled_sql
+    assert "RETURNING webhook_deliveries.id" in compiled_sql
+    assert str(token) in compiled_sql
     session.commit.assert_called_once()
 
 
@@ -155,6 +170,8 @@ def test_claim_github_webhook_delivery_expired_lease_reclaims(
     app_settings: AppSettings,
 ) -> None:
     """4. An expired processing lease (e.g. after worker crash or release) is reclaimed with a new token."""
+    from sqlalchemy.dialects import postgresql
+
     fake_engine = object()
     session = MagicMock()
     exec_result = MagicMock()
@@ -180,6 +197,17 @@ def test_claim_github_webhook_delivery_expired_lease_reclaims(
     assert status == "claimed"
     assert isinstance(token, uuid.UUID)
     session.execute.assert_called_once()
+    executed_stmt = session.execute.call_args[0][0]
+    compiled_sql = str(
+        executed_stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "ON CONFLICT (github_delivery_id) DO UPDATE" in compiled_sql
+    assert "webhook_deliveries.processed IS false" in compiled_sql
+    assert "webhook_deliveries.claimed_at <" in compiled_sql
+    assert str(token) in compiled_sql
     session.commit.assert_called_once()
 
 
@@ -239,7 +267,7 @@ def test_release_github_webhook_delivery_stale_owner_cannot_release_newer_owner(
     session.execute.assert_called_once()
     executed_stmt = session.execute.call_args[0][0]
     compiled_str = str(executed_stmt.compile(compile_kwargs={"literal_binds": True}))
-    assert old_token.hex in compiled_str
+    assert (old_token.hex in compiled_str or str(old_token) in compiled_str)
     session.commit.assert_called_once()
 
 
@@ -302,6 +330,11 @@ def test_mark_github_webhook_delivery_processed_success_with_token(
             )
 
     session.execute.assert_called_once()
+    executed_stmt = session.execute.call_args[0][0]
+    compiled_str = str(executed_stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "UPDATE webhook_deliveries SET processed=true" in compiled_str
+    assert "webhook_deliveries.github_delivery_id = 'deliv-done-1'" in compiled_str
+    assert (token.hex in compiled_str or str(token) in compiled_str)
     session.commit.assert_called_once()
 
 
