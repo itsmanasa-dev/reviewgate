@@ -189,12 +189,59 @@ def weak_body_warning(body: str) -> EngineWarning | None:
     return None
 
 
+WARN_CODE_OVERLONG_BODY: Final[str] = "overlong_pr_body"
+"""Stable warning code for PR descriptions exceeding configured limits."""
+
+
+def overlong_body_warning(
+    body: str,
+    *,
+    warn_threshold: int,
+    fail_threshold: int,
+) -> EngineWarning | None:
+    """Check meaningful PR-body length against configured upper bounds.
+
+    Both thresholds set to zero disable this check. Other combinations
+    are validated by :class:`reviewgate.core.config.Thresholds`.
+    """
+
+    if warn_threshold == fail_threshold == 0:
+        return None
+
+    count = meaningful_char_count(body)
+    if count > fail_threshold:
+        severity: WarningSeverity = "high"
+        threshold = fail_threshold
+    elif count > warn_threshold:
+        severity = "medium"
+        threshold = warn_threshold
+    else:
+        return None
+
+    return EngineWarning(
+        code=WARN_CODE_OVERLONG_BODY,
+        severity=severity,
+        message=(
+            f"PR body contains {count} meaningful characters, exceeding "
+            f"the configured {threshold}-character limit. Consider "
+            "keeping the PR summary focused and linking detailed documentation."
+        ),
+        evidence={
+            "meaningful_chars": count,
+            "warn_threshold": warn_threshold,
+            "fail_threshold": fail_threshold,
+        },
+    )
+
+
 __all__ = [
     "MIN_MEANINGFUL_CHARS",
     "REASON_EMPTY",
     "REASON_INSUFFICIENT",
     "WARN_CODE_WEAK_BODY",
+    "WARN_CODE_OVERLONG_BODY",
     "meaningful_char_count",
     "meaningful_text",
+    "overlong_body_warning",
     "weak_body_warning",
 ]

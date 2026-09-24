@@ -589,6 +589,7 @@ The deterministic engine is the foundation of trust. It must work without LLMs.
 warn:
   files_changed: 25
   human_loc_changed: 800
+  per_file_human_loc: 0
   risky_files_changed: 2
   dependency_files_changed: 1
   config_files_changed: 1
@@ -596,10 +597,46 @@ warn:
 fail:
   files_changed: 75
   human_loc_changed: 2500
+  per_file_human_loc: 0
   risky_files_without_context: 1
 ```
 
 Important: use `human_loc_changed`, not raw LOC changed, for size severity.
+
+### Per-file LOC thresholds (issue #171)
+
+The `file_too_large` heuristic checks each categorized file's `changes`
+value only when `human_authored` is true. This measures changed LOC rather
+than total file length. The default `warn.per_file_human_loc` and
+`fail.per_file_human_loc` values are both 0, disabling this check until a
+repository opts in. Set either to a positive integer to enable its tier.
+When both are enabled, the fail limit must be at least the warn limit.
+Negative values or reversed enabled limits trigger the normal §12
+`config_invalid` recovery behavior.
+
+A file triggers medium severity when its changed LOC is above the warn
+limit; it triggers high severity above the fail limit. Exact equality
+does not trigger that tier. Only one warning is emitted per offending file,
+with `filename`, `human_loc_changed`, and `threshold` in its evidence.
+Warnings follow normal §10.13 aggregation.
+
+`thresholds.per_file_loc_exempt_paths` is an empty list by default and
+accepts gitignore-style globs. Matching files skip only `file_too_large`;
+they retain their existing file categories and still count toward
+aggregate LOC, other size checks, and all other heuristics. Unlike the
+top-level `ignored_paths`, this setting does not remove files from analysis.
+
+Example opt-in:
+
+```yaml
+thresholds:
+  warn:
+    per_file_human_loc: 300
+  fail:
+    per_file_human_loc: 800
+  per_file_loc_exempt_paths:
+    - "testdata/**"
+```
 
 ## 10.4 Post-exclusion LOC (`human_loc_changed`)
 
@@ -796,6 +833,21 @@ Warn if body is:
 * fewer than 80 meaningful characters
 * mostly template headings without content
 
+### Overlong PR body (issue #142)
+
+Count meaningful non-whitespace characters using the same normalization
+as the weak-body check. By default, descriptions exceeding 3,000
+characters emit `overlong_pr_body` with medium severity; exceeding
+8,000 emits high severity. Exact threshold values do not trigger the
+next tier. The warning includes the count and both thresholds as evidence
+and follows the normal §10.13 verdict aggregation.
+
+Configure these limits via `thresholds.warn.pr_body_chars` and
+`thresholds.fail.pr_body_chars`. The fail limit must be at least the warn
+limit, and the enabled warn limit must be at least 80. Set both to zero
+to disable the upper-bound check. Invalid configurations follow the
+existing §12 fallback-to-defaults behavior. No LLM is involved.
+
 ### Missing linked issue
 
 Warn if no issue/ticket reference appears in title or body.
@@ -874,6 +926,72 @@ def baseline_reviewability(warnings):
     return "PASS"
 ```
 
+## 10.14 Excessive code-comment verbosity (issue #143)
+
+A deterministic heuristic measuring how much commentary a PR **introduces**.
+It reads only the optional unified diff in `ChangedFile.patch` and never
+judges whether a comment is useful, correct, or who or what wrote it.
+
+### Inputs
+
+* `ChangedFile.patch` (added lines only), the categorizer's `source` +
+  `human_authored` verdict, and the `policy.code_comments` config block.
+
+### Warning codes
+
+| Code | Meaning |
+| --- | --- |
+| `oversized_comment_block` | the PR-wide maximum newly-added consecutive full-line comment block reaches a threshold (one warning per PR, filename in evidence) |
+| `excessive_comment_lines` | newly-added full-line comment lines across eligible files reach a threshold |
+| `comment_heavy_diff` | the added comment-to-source ratio reaches a threshold, only at or above `min_added_source_lines` |
+
+Thresholds are inclusive lower bounds, matching §10.3. Severity is `medium`
+at the warn tier and `high` at the fail tier; both feed §10.13 with no
+special verdict path. Each dimension emits at most one warning per PR, the
+same one-warning-per-dimension convention as `size_warnings`.
+
+### Stats keys
+
+When the policy is enabled, `report.stats` gains `comment_lines_added`,
+`code_lines_added`, `largest_comment_block_lines`, and `comment_ratio`
+(rounded to 4 decimals). When disabled, no warnings and no stats keys are
+emitted.
+
+### Hunk entry state
+
+A hunk that does not start at new-file line 0 or 1 begins at a lexical
+position the patch does not establish. It starts unestablished and is
+analyzed only once two consecutive context lines establish a normal code
+position. Each of those lines must satisfy two independent conditions: it
+leaves no multi-line construct open (no string, block comment, or heredoc),
+and it carries a code token. Scanning clean alone is not evidence of a code
+position, because two lines of docstring prose scan clean under a reset
+scanner and would otherwise establish a position that does not exist. Blank
+context lines are neutral: they neither extend the run nor break it, so two
+blanks cannot establish a hunk on no evidence while the `code / blank /
+code` context that `git diff -U3` produces still can. Until established, a
+hunk contributes nothing. The residual case, a hunk beginning two or more
+lines into a multi-line string body whose leading context lines happen to
+carry code tokens, is disclosed in the README rather than claimed to be
+impossible, because a patch does not carry enough information to rule it
+out.
+
+### Language coverage
+
+Comment syntax is modeled for Python, Shell, JavaScript, TypeScript
+(without JSX/TSX), and Go. An in-scope source file in any other language is
+not classified, but its added non-blank lines still join the
+`comment_ratio` denominator (never the numerator). Dropping them would
+compute the ratio over the readable files only and manufacture the false
+positive the heuristic exists to avoid.
+
+### Diff parsing
+
+File headers are detected by position: everything before the first `@@` of a
+file's section is preamble. Content-shaped matching for `+++ ` / `--- `
+would misread an added `++i` (emitted as `+++i`) and a deleted shell `-- )`
+(emitted as `--- ) ...`).
+
 ---
 
 ## 11. Hosted LLM Reviewability Layer
@@ -922,6 +1040,23 @@ Fallback order:
 ## 11.4 Token and cost budget
 
 Set explicit budgets.
+
+Hosted model pricing must match the model selected by
+`REVIEWGATE_LLM_MODEL`. The existing bundled input/output estimates
+($0.150/$0.600 per million tokens) apply only to the exact default
+`gpt-4o-mini` model; they are historical estimates, not a live pricing feed.
+Operators must verify current provider pricing and can override both rates
+through `REVIEWGATE_LLM_INPUT_USD_PER_MILLION` and
+`REVIEWGATE_LLM_OUTPUT_USD_PER_MILLION`. Both environment variables must be
+provided together, with non-negative numeric values.
+
+For any other model without a complete explicit price pair, the hosted LLM
+stage logs `hosted_llm_skipped_unknown_model_pricing` and returns the
+deterministic report without contacting the provider. The same resolved
+prices feed both the pre-flight estimate and post-hoc token-cost accounting,
+including the parse-failure path. Pre-flight tokens and completion length are
+estimates: the $0.20 check is not a provider-enforced spending guarantee.
+Operators should update the configured rates when provider pricing changes.
 
 Initial recommended model tier:
 
@@ -1099,6 +1234,17 @@ policy:
   fail_on_risky_paths_without_context: true
   fail_on_huge_pr: true
   warn_blocks_merge: false
+  code_comments: # issue #143, see §10.14
+    enabled: true # false disables the heuristic and its stats keys
+    warn:
+      max_block_lines: 10
+      max_total_lines: 60
+      max_comment_ratio: 0.45
+    fail:
+      max_block_lines: 25
+      max_total_lines: 150
+      max_comment_ratio: 0.70
+    min_added_source_lines: 20 # ratio stays silent below this sample size
 
 risky_paths:
   - "**/migrations/**"
@@ -1701,6 +1847,14 @@ create table analysis_reports (
 );
 ```
 
+`llm_used` records whether the LLM narrative was merged into the published
+report. It does **not** indicate whether the provider was billed: when the
+response fails to parse (§11.3 fallback), the call is still charged, and
+`llm_provider`, `input_tokens`, `output_tokens` and `estimated_cost_usd` are
+populated while `llm_used` stays false. Cost and token rollups must therefore
+filter on `estimated_cost_usd IS NOT NULL`, not on `llm_used`, or they will
+under-count exactly the retried and repaired calls that §11.4 budgets target.
+
 ### beta_leads
 
 ```sql
@@ -2129,6 +2283,16 @@ per installation: 500 analyses/day
 per repo: 100 analyses/day
 per PR/head SHA/config: cached
 ```
+
+Quota charging happens only after the worker lock, final-result cache,
+database deduplication, and repository-context validation have passed.
+An atomic Redis operation checks both daily counters and records a marker
+derived from the five-part analysis natural key (repository, PR number,
+head SHA, config hash, PR metadata hash). Retries of that same analysis
+reuse its existing charge, including across a UTC day boundary while
+the marker remains valid. New analysis keys consume their own quota.
+The marker and counters have a three-day TTL. Redis failures retain
+the existing fail-open behavior.
 
 ## 22.3 Huge PR handling
 

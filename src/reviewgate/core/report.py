@@ -50,7 +50,11 @@ from .mixed_concern import WARN_CODE_MIXED_CONCERN
 from .pr_body import WARN_CODE_WEAK_BODY
 from .risky_paths import WARN_CODE_RISKY_NO_RATIONALE
 from .schemas import EngineWarning, Reviewability
-from .size import WARN_CODE_TOO_LARGE_HUMAN_LOC, WARN_CODE_TOO_MANY_FILES
+from .size import (
+    WARN_CODE_FILE_TOO_LARGE,
+    WARN_CODE_TOO_LARGE_HUMAN_LOC,
+    WARN_CODE_TOO_MANY_FILES,
+)
 from .tests_coverage import WARN_CODE_MISSING_TESTS_FOR_SOURCE
 
 # Concern-label rules in spec enumeration order. Each entry pairs the
@@ -63,7 +67,9 @@ from .tests_coverage import WARN_CODE_MISSING_TESTS_FOR_SOURCE
 _LabelGetter = Callable[[Labels], str]
 _CONCERN_RULES: Final[tuple[tuple[frozenset[str], _LabelGetter], ...]] = (
     (
-        frozenset({WARN_CODE_TOO_MANY_FILES, WARN_CODE_TOO_LARGE_HUMAN_LOC}),
+        frozenset(
+            {WARN_CODE_TOO_MANY_FILES, WARN_CODE_TOO_LARGE_HUMAN_LOC, WARN_CODE_FILE_TOO_LARGE}
+        ),
         lambda labels: labels.too_large,
     ),
     (

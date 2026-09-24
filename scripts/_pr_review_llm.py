@@ -104,7 +104,7 @@ def parse_diff_right_side(diff_text: str) -> DiffIndex:
             current_path = None
             in_hunk = False
             continue
-        if raw.startswith("+++ "):
+        if not in_hunk and raw.startswith("+++ "):
             target = raw[4:].strip()
             if target == "/dev/null":
                 current_path = None
@@ -116,7 +116,7 @@ def parse_diff_right_side(diff_text: str) -> DiffIndex:
                 index.setdefault(current_path, set())
             in_hunk = False
             continue
-        if raw.startswith("--- "):
+        if not in_hunk and raw.startswith("--- "):
             in_hunk = False
             continue
         m = _HUNK_HEADER_RE.match(raw)

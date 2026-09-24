@@ -16,7 +16,9 @@ Example:
 
 from __future__ import annotations
 
-from pydantic import Field, SecretStr
+from decimal import Decimal
+
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,8 +56,7 @@ class AppSettings(BaseSettings):
     github_app_id: int | None = Field(
         default=None,
         description=(
-            "Numeric GitHub App ID (``docs/DESIGN.md`` §13.4) used as the JWT "
-            "``iss`` claim."
+            "Numeric GitHub App ID (``docs/DESIGN.md`` §13.4) used as the JWT ``iss`` claim."
         ),
     )
     github_app_private_key: SecretStr | None = Field(
@@ -126,3 +127,32 @@ class AppSettings(BaseSettings):
             "is held before an in-flight or crashed attempt is considered expired."
         ),
     )
+    llm_input_usd_per_million: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Explicit USD per million input tokens for the configured LLM. "
+            "Set together with llm_output_usd_per_million for non-default models."
+        ),
+    )
+    llm_output_usd_per_million: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Explicit USD per million output tokens for the configured LLM. "
+            "Set together with llm_input_usd_per_million for non-default models."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_llm_pricing(self) -> AppSettings:
+        """Require both token prices together to avoid partial cost estimates."""
+
+        input_set = self.llm_input_usd_per_million is not None
+        output_set = self.llm_output_usd_per_million is not None
+        if input_set != output_set:
+            raise ValueError(
+                "REVIEWGATE_LLM_INPUT_USD_PER_MILLION and "
+                "REVIEWGATE_LLM_OUTPUT_USD_PER_MILLION must be set together"
+            )
+        return self

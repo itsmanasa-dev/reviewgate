@@ -20,22 +20,24 @@ from pydantic import JsonValue, ValidationError
 from .aggregate import baseline_reviewability
 from .automation_pr import finalize_size_stats_for_pr_author
 from .categorizer import Categorizer
+from .code_comments import analyze_added_comments
 from .config import DEFAULT_RISKY_PATHS, ReviewGateConfig
 from .count_warnings import warn_threshold_count_warnings
 from .ignored_paths import filter_out_ignored_paths
 from .linked_issue import linked_issue_warning
 from .mixed_concern import mixed_concern_warning
-from .pr_body import weak_body_warning
+from .pr_body import overlong_body_warning, weak_body_warning
 from .report import suggested_labels
 from .risky_paths import risky_paths_warning
 from .schemas import ChangedFile, EngineInput, EngineWarning, PRRecord, ReviewabilityReport
-from .size import compute_size_stats, size_warnings
+from .size import compute_size_stats, per_file_loc_warnings, size_warnings
 from .tests_coverage import missing_tests_for_source_warning
 
 
 def _merge_size_and_automation_stats(
     size_dump: dict[str, JsonValue],
     automation: dict[str, JsonValue],
+    extra: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     """Merge §10.4 :class:`SizeStats` JSON with automation extras.
 
@@ -46,15 +48,21 @@ def _merge_size_and_automation_stats(
         A new dict suitable for ``ReviewabilityReport.stats``.
     """
 
-    overlap = size_dump.keys() & automation.keys()
+    parts = [size_dump, automation] + ([extra] if extra else [])
+    overlap: set[str] = set()
+    for i, part in enumerate(parts):
+        for later in parts[i + 1 :]:
+            overlap |= part.keys() & later.keys()
     if overlap:
         raise RuntimeError(
-            "ReviewGate internal error: SizeStats fields overlap automation stats "
-            f"(collision keys: {sorted(overlap)}). Resolve naming between "
-            "`reviewgate.core.size.SizeStats` and `reviewgate.core.automation_pr`."
+            "ReviewGate internal error: stats producer key collision on keys "
+            f"{sorted(overlap)}. Resolve naming between "
+            "`reviewgate.core.size.SizeStats`, `reviewgate.core.automation_pr`, "
+            "and `reviewgate.core.code_comments`."
         )
-    merged: dict[str, JsonValue] = dict(size_dump)
-    merged.update(automation)
+    merged: dict[str, JsonValue] = {}
+    for part in parts:
+        merged.update(part)
     return merged
 
 
@@ -75,9 +83,12 @@ def analyze(engine_input: EngineInput) -> ReviewabilityReport:
           ``human_loc_changed``) plus ``files_changed`` / ``additions`` /
           ``deletions``, merged with §10.4.1–§10.4.2 keys from
           :mod:`reviewgate.core.automation_pr` (``pr_author_kind``,
-          ``pr_author_login``, optional manifest-only flags).
+          ``pr_author_login``, optional manifest-only flags) and, when
+          ``policy.code_comments`` is enabled, the added-comment volume
+          keys from :mod:`reviewgate.core.code_comments`.
         * ``warnings`` -- size warnings from \u00a710.3 thresholds; further
-          heuristics (#11-#14) extend this list as they land.
+          heuristics (#11-#14, #143 code-comment verbosity) extend this
+          list as they land.
         * ``reviewability`` -- result of
           :func:`baseline_reviewability` over those warnings (\u00a710.13).
     """
@@ -120,6 +131,15 @@ def analyze(engine_input: EngineInput) -> ReviewabilityReport:
     )
 
     warnings.extend(
+        per_file_loc_warnings(
+            file_categories,
+            warn_per_file_human_loc=config.thresholds.warn.per_file_human_loc,
+            fail_per_file_human_loc=config.thresholds.fail.per_file_human_loc,
+            exempt_paths=config.thresholds.per_file_loc_exempt_paths,
+        )
+    )
+
+    warnings.extend(
         warn_threshold_count_warnings(file_categories, config.thresholds.warn),
     )
 
@@ -127,6 +147,14 @@ def analyze(engine_input: EngineInput) -> ReviewabilityReport:
         body_warning = weak_body_warning(pr.body)
         if body_warning is not None:
             warnings.append(body_warning)
+
+    body_length_warning = overlong_body_warning(
+        pr.body,
+        warn_threshold=config.thresholds.warn.pr_body_chars,
+        fail_threshold=config.thresholds.fail.pr_body_chars,
+    )
+    if body_length_warning is not None:
+        warnings.append(body_length_warning)
 
     issue_warning = linked_issue_warning(
         pr.title,
@@ -152,10 +180,21 @@ def analyze(engine_input: EngineInput) -> ReviewabilityReport:
     if tests_warning is not None:
         warnings.append(tests_warning)
 
+    comment_stats: dict[str, JsonValue] | None = None
+    if config.policy.code_comments.enabled:
+        comment_analysis = analyze_added_comments(
+            active_files,
+            file_categories,
+            config.policy.code_comments,
+        )
+        warnings.extend(comment_analysis.warnings)
+        comment_stats = comment_analysis.stats.model_dump(mode="json")
+
     verdict = baseline_reviewability(warnings)
     stats_payload = _merge_size_and_automation_stats(
         stats.model_dump(mode="json"),
         automation_stats,
+        extra=comment_stats,
     )
     return ReviewabilityReport(
         reviewability=verdict,

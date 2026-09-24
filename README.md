@@ -191,6 +191,14 @@ asserts `pyproject.toml` does not pull a forbidden runtime dependency.
 Drop a `.reviewgate.yml` at the repo root on the default branch. Every
 key has a documented default; an empty file is valid.
 
+Hosted LLM pricing is configured by **application environment variables**,
+not repository YAML. The built-in historical estimates are used only for
+the default `gpt-4o-mini` model. When changing `REVIEWGATE_LLM_MODEL`, set
+both `REVIEWGATE_LLM_INPUT_USD_PER_MILLION` and
+`REVIEWGATE_LLM_OUTPUT_USD_PER_MILLION` to the provider's verified USD prices
+per million tokens. An unknown model without both rates is skipped rather
+than being billed at the mini-model rate; see `docs/DESIGN.md` §11.4.
+
 ```yaml
 version: 1
 mode: app                           # §14.1 coexistence: app | action | both
@@ -200,14 +208,30 @@ thresholds:                          # §10.3
   warn:
     files_changed: 25
     human_loc_changed: 800
+    pr_body_chars: 3000
+    per_file_human_loc: 0             # opt in: e.g. 300
   fail:
     files_changed: 75
     human_loc_changed: 2500
+    pr_body_chars: 8000
+    per_file_human_loc: 0             # opt in: e.g. 800
+  per_file_loc_exempt_paths: []       # e.g. ["testdata/**"]
 
 policy:                              # §10.10
   require_linked_issue: true
   require_human_summary: true
   fail_on_risky_paths_without_context: true
+  code_comments:                     # issue #143 — comment-verbosity limits
+    enabled: true
+    warn:
+      max_block_lines: 10
+      max_total_lines: 60
+      max_comment_ratio: 0.45
+    fail:
+      max_block_lines: 25
+      max_total_lines: 150
+      max_comment_ratio: 0.70
+    min_added_source_lines: 20
 
 risky_paths:                         # §10.6 — defaults already cover migrations,
   - "**/migrations/**"               #         auth, billing, payments, infra,
@@ -223,6 +247,10 @@ status_check:                        # §13.10
   name: reviewgate/reviewability
   fail_on: FAIL
 ```
+
+The PR-body limits count meaningful non-whitespace characters after removing Markdown/template scaffolding. Above the warn limit produces `overlong_pr_body` (medium); above the fail limit produces high severity. Set both `pr_body_chars` values to `0` to disable this check. The fail limit must be at least the warn limit, and enabled limits must start at 80 characters or more.
+
+The per-file LOC check is disabled by default. Set `thresholds.warn.per_file_human_loc` and/or `thresholds.fail.per_file_human_loc` to positive values to enable it; a file triggers a tier only when its changed human LOC is **above** that limit. If both are enabled, the fail limit must not be lower than the warn limit. `thresholds.per_file_loc_exempt_paths` uses gitignore-style globs and affects only `file_too_large`; exempt files still contribute to aggregate size and all other checks.
 
 Strict by design:
 
@@ -253,6 +281,7 @@ module ties back to a §-numbered section of `docs/DESIGN.md`:
 | [`linked_issue.py`](src/reviewgate/core/linked_issue.py) | Linked-issue / ticket reference detection | §10.10 |
 | [`risky_paths.py`](src/reviewgate/core/risky_paths.py) | Risky-paths-without-rationale heuristic | §10.6, §10.10 |
 | [`mixed_concern.py`](src/reviewgate/core/mixed_concern.py) | Mixed-concern category clusters | §10.11 |
+| [`code_comments.py`](src/reviewgate/core/code_comments.py) | Excessive added-comment verbosity (blocks, totals, ratio); scanner split into [`_comment_lex.py`](src/reviewgate/core/_comment_lex.py) / [`_comment_scan.py`](src/reviewgate/core/_comment_scan.py), policy models in [`comment_policy.py`](src/reviewgate/core/comment_policy.py) | issue #143, §10.14 |
 | [`aggregate.py`](src/reviewgate/core/aggregate.py) | PASS / WARN / FAIL aggregation | §10.13 |
 | [`report.py`](src/reviewgate/core/report.py) | Suggested-label assembly from warnings + config | §13.9, §12 |
 | [`cli.py`](src/reviewgate/core/cli.py) | `reviewgate-core` console script for fixture-driven runs | §5.1, §25 M1 |
@@ -263,10 +292,14 @@ module ties back to a §-numbered section of `docs/DESIGN.md`:
 | ------------ | -------- | ------- | ------- |
 | `too_many_files_changed` | medium / high | `files_changed > thresholds.warn / fail.files_changed` | §10.3 |
 | `too_large_human_loc` | medium / high | `human_loc_changed > thresholds.warn / fail.human_loc_changed` | §10.3 / §10.4 |
+| `file_too_large` | medium / high | An individual non-exempt human file exceeds an enabled per-file LOC threshold | #171 |
 | `weak_pr_body` | medium | empty / whitespace / template-only / < 80 meaningful chars | §10.10 |
 | `missing_linked_issue` | medium | no `#123`, `GH-123`, `fixes #…`, external tracker URL, or `ABC-123` | §10.10 |
 | `risky_paths_without_rationale` | high | risky paths touched and PR body has no justification | §10.10 |
 | `mixed_concerns` | medium | suspicious category cluster (billing + auth + infra, etc.) | §10.11 |
+| `oversized_comment_block` | medium / high | PR-wide maximum newly-added consecutive full-line comment block reaches `policy.code_comments.warn / fail.max_block_lines` (one warning, filename in evidence) | issue #143 |
+| `excessive_comment_lines` | medium / high | newly-added full-line comment lines across eligible files reach `policy.code_comments.warn / fail.max_total_lines` | issue #143 |
+| `comment_heavy_diff` | medium / high | added comment-to-source ratio reaches `policy.code_comments.warn / fail.max_comment_ratio` (only at or above `min_added_source_lines`) | issue #143 |
 | `config_invalid` | low | `.reviewgate.yml` failed to parse; engine ran with defaults | §12 |
 
 Verdict aggregation (§10.13):
@@ -280,6 +313,76 @@ def baseline_reviewability(warnings):
     if high == 1 or medium >= 2: return "WARN"
     return "PASS"
 ```
+
+### Code-comment verbosity (issue #143)
+
+The `code_comments` heuristic measures how much commentary a PR
+**introduces** -- never whether a comment is useful, correct, or who or
+what wrote it. It reads the optional unified diff in
+`ChangedFile.patch`. Only added lines contribute to metrics; deleted
+lines are dropped. Unchanged context lines are scanned so lexical state
+(open `/* */` blocks, strings, heredocs) stays accurate, but they are
+never tallied. A hunk that does not start at new-file line 0 or 1
+begins at a lexical position the patch does not establish, so it starts
+unestablished and is analyzed only once its own context lines have
+established a normal code position. A context line counts as evidence
+only when it satisfies two independent conditions: it scans clean,
+leaving no string, block comment, or heredoc open, and it carries a code
+token (an operator such as `=`, `(`, `{`, or `;`, or a keyword such as
+`def` or `yield`). Two such consecutive lines are required. Scanning
+clean on its own is not evidence: it proves the scanner made no error,
+not that its guess about where the hunk begins was right, and two lines
+of docstring prose satisfy it. Blank context lines are neutral: they
+neither add to the run nor break it. Until a hunk is established it
+contributes nothing at all, rather than guessing.
+
+Scope and parsing rules (conservative by design; false negatives are
+preferred):
+
+* Only files the categorizer marks `source` and `human_authored` are
+  analyzed -- docs, generated, vendored, minified, snapshot, asset,
+  lockfile, and manifest files are excluded.
+* Supported comment syntaxes are those whose multiline string forms the
+  scanner actually models: `#` (Python, Shell) and `//` / `/* */`
+  (JavaScript, TypeScript without JSX/TSX, Go). Java, C, C++, C#, Rust,
+  and JSX/TSX are not classified until their raw strings, text blocks,
+  and JSX text can be handled without false positives.
+* An in-scope source file in an unclassified language still counts
+  toward `comment_ratio`: its added non-blank lines join the
+  denominator, never the numerator. Dropping them would inflate the
+  ratio over the files the scanner can read and manufacture exactly the
+  false positive this heuristic is designed to avoid.
+* A small lexical scanner tracks string literals -- including JS/Go
+  backtick strings and shell quotes/heredocs -- so
+  `url = "https://example.com"`, `pattern = "#[a-z]+"`,
+  template-literal bodies, and heredoc bodies are never miscounted.
+* Unified-diff file headers are detected by position, not by content:
+  everything before the first `@@` of a file's section is preamble.
+  Sniffing for `+++ ` / `--- ` instead would misread an added `++i`
+  (emitted as `+++i`) and a deleted shell `-- )` (emitted as
+  `--- ) ...`).
+* A line counts as a comment only when it is a full-line comment.
+  Trailing (inline) comments are not counted in this MVP.
+* Python docstrings are string literals and may be runtime data, so they
+  are never counted as comments. One residual case remains: a hunk that
+  begins two or more lines inside a docstring opened above Git's context
+  window, where those leading context lines happen to carry a code token.
+  A patch does not carry enough information to rule that out, so it is
+  documented here rather than claimed to be impossible.
+* A comment block is a run of consecutive added comment lines; blank
+  lines, code lines, and pre-existing context lines terminate it.
+* `oversized_comment_block` emits at most one warning per PR, for the
+  largest added consecutive comment block, with the filename in evidence
+  (the same one-warning-per-dimension convention as `size_warnings`).
+* `comment_ratio = comment_lines_added / added non-blank source lines`,
+  reported to 4 decimal places in `stats` and warning evidence.
+
+The ratio dimension stays silent while a PR adds fewer than
+`min_added_source_lines` (default 20) non-blank source lines, so a
+one-line work-around comment cannot produce a misleading 50% ratio;
+block and total-volume dimensions stay active on small diffs. Set
+`policy.code_comments.enabled: false` to disable the heuristic entirely;
+no warnings or comment stats are emitted in that case.
 
 ---
 

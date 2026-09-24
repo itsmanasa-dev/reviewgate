@@ -763,3 +763,144 @@ def test_worker_app_import_requires_redis_url(
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+
+def test_cache_is_written_only_after_successful_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #152: failed commits must not poison the final-result cache."""
+    import uuid
+    from contextlib import nullcontext
+    from datetime import UTC, datetime
+
+    import dramatiq
+    from dramatiq.brokers.stub import StubBroker
+    from sqlalchemy import MetaData, create_engine, select
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from reviewgate.app.storage.models import (
+        Analysis,
+        AnalysisReport,
+        Installation,
+        Repository,
+    )
+    import reviewgate.app.analysis.jobs as jobs
+
+    dramatiq.set_broker(StubBroker())
+
+    metadata = MetaData()
+    for model in (Installation, Repository, Analysis, AnalysisReport):
+        model.__table__.to_metadata(metadata)
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    metadata.create_all(engine)
+
+    setup_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    installation_id = uuid.uuid4()
+    repository_id = uuid.uuid4()
+    now = datetime.now(tz=UTC)
+
+    with setup_factory() as session:
+        session.add(
+            Installation(
+                id=installation_id,
+                github_installation_id=8152,
+                account_login="acme",
+                account_type="Organization",
+                created_at=now,
+            )
+        )
+        session.add(
+            Repository(
+                id=repository_id,
+                installation_id=installation_id,
+                github_repository_id=9152,
+                owner="acme",
+                name="demo",
+                full_name="acme/demo",
+                private=False,
+                active=True,
+                created_at=now,
+            )
+        )
+        session.commit()
+
+    fail_once = {"value": True}
+
+    class FailFirstCommitSession(Session):
+        def commit(self) -> None:
+            if fail_once["value"]:
+                fail_once["value"] = False
+                raise RuntimeError("simulated commit failure")
+            super().commit()
+
+    worker_factory = sessionmaker(
+        bind=engine,
+        class_=FailFirstCommitSession,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+
+    cache = {}
+    cache_writes = []
+    published = []
+
+    def cache_write(_settings, _key, report):
+        cache_writes.append(report)
+        cache["result"] = report
+
+    monkeypatch.setenv("REVIEWGATE_REDIS_URL", "redis://127.0.0.1:6379/0")
+    monkeypatch.setattr(jobs, "create_engine_from_settings", lambda _s: engine)
+    monkeypatch.setattr(jobs, "create_session_factory", lambda _e: worker_factory)
+    monkeypatch.setattr(jobs, "worker_job_lock_hold", lambda *_a: nullcontext(True))
+    monkeypatch.setattr(jobs, "check_analysis_rate_limits", lambda *_a, **_k: "ok")
+    monkeypatch.setattr(
+        jobs,
+        "get_cached_final_report",
+        lambda *_a: cache.get("result"),
+    )
+    monkeypatch.setattr(jobs, "set_cached_final_report", cache_write)
+    monkeypatch.setattr(
+        jobs,
+        "run_pr_analysis_for_natural_key",
+        lambda *_a, **_k: _pipeline_success_tuple(),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "publish_hosted_pr_github_feedback",
+        lambda *_a, **_k: published.append(True),
+    )
+
+    payload = {
+        "github_installation_id": 8152,
+        "github_repository_id": 9152,
+        "reviewgate_repository_id": str(repository_id),
+        "reviewgate_pull_number": 1,
+        "reviewgate_head_sha": "sha1",
+        "reviewgate_config_hash": "config1",
+        "reviewgate_pr_metadata_hash": "metadata1",
+    }
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        jobs.run_pr_analysis_stub(dict(payload))
+
+    assert cache == {}, "Failed transaction poisoned Redis cache"
+    assert cache_writes == []
+    assert published == []
+
+    with setup_factory() as session:
+        assert session.execute(select(Analysis)).scalars().all() == []
+        assert session.execute(select(AnalysisReport)).scalars().all() == []
+
+    # Dramatiq retries the same request after the transient DB failure.
+    jobs.run_pr_analysis_stub(dict(payload))
+
+    assert len(cache_writes) == 1
+    assert cache["result"]["reviewability"] == "PASS"
+    assert published == [True]
+
+    with setup_factory() as session:
+        analysis = session.execute(select(Analysis)).scalar_one()
+        assert analysis.status == "completed"
+        assert len(session.execute(select(AnalysisReport)).scalars().all()) == 1

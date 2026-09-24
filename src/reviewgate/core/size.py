@@ -32,6 +32,7 @@ from typing import Final
 from pydantic import Field
 
 from ._base import StrictModel
+from .paths import PathMatcher
 from .schemas import EngineWarning, FileCategoryRow, WarningSeverity
 
 # Stable warning codes (\u00a710.12). One code per size dimension; severity
@@ -42,6 +43,9 @@ WARN_CODE_TOO_MANY_FILES: Final[str] = "too_many_files_changed"
 
 WARN_CODE_TOO_LARGE_HUMAN_LOC: Final[str] = "too_large_human_loc"
 """Emitted when ``human_loc_changed`` reaches the warn or fail threshold."""
+
+WARN_CODE_FILE_TOO_LARGE: Final[str] = "file_too_large"
+"""Emitted for each non-exempt file exceeding a per-file human LOC limit."""
 
 _SEVERITY_FAIL: Final[WarningSeverity] = "high"
 _SEVERITY_WARN: Final[WarningSeverity] = "medium"
@@ -189,6 +193,67 @@ def size_warnings(
     return warnings
 
 
+def per_file_loc_warnings(
+    file_categories: Iterable[FileCategoryRow],
+    *,
+    warn_per_file_human_loc: int,
+    fail_per_file_human_loc: int,
+    exempt_paths: Iterable[str] = (),
+) -> list[EngineWarning]:
+    """Emit one warning per non-exempt file exceeding a human LOC limit.
+
+    Args:
+        file_categories: Categorized changed files in report order.
+        warn_per_file_human_loc: Medium-severity upper bound; zero disables it.
+        fail_per_file_human_loc: High-severity upper bound; zero disables it.
+        exempt_paths: Gitignore-style globs affecting only this check.
+
+    Returns:
+        Warnings in file order. Non-human-authored and exempt files never
+        trigger this rule; neither exclusion changes aggregate size stats.
+    """
+
+    if warn_per_file_human_loc == fail_per_file_human_loc == 0:
+        return []
+
+    exempt = PathMatcher(exempt_paths)
+    warnings: list[EngineWarning] = []
+
+    for row in file_categories:
+        if not row.human_authored or exempt.matches(row.filename):
+            continue
+
+        if fail_per_file_human_loc > 0 and row.changes > fail_per_file_human_loc:
+            severity = _SEVERITY_FAIL
+            threshold = fail_per_file_human_loc
+            tier = "fail"
+        elif warn_per_file_human_loc > 0 and row.changes > warn_per_file_human_loc:
+            severity = _SEVERITY_WARN
+            threshold = warn_per_file_human_loc
+            tier = "warn"
+        else:
+            continue
+
+        warnings.append(
+            EngineWarning(
+                code=WARN_CODE_FILE_TOO_LARGE,
+                severity=severity,
+                message=(
+                    f"{row.filename} changes {row.changes} human LOC, "
+                    f"above the per-file {tier} threshold of {threshold}. "
+                    "Consider splitting or explaining the large file change."
+                ),
+                evidence={
+                    "filename": row.filename,
+                    "human_loc_changed": row.changes,
+                    "threshold": threshold,
+                },
+            )
+        )
+
+    return warnings
+
+
 def _threshold_warning(
     *,
     code: str,
@@ -235,8 +300,10 @@ def _threshold_warning(
 
 __all__ = [
     "SizeStats",
+    "WARN_CODE_FILE_TOO_LARGE",
     "WARN_CODE_TOO_LARGE_HUMAN_LOC",
     "WARN_CODE_TOO_MANY_FILES",
     "compute_size_stats",
+    "per_file_loc_warnings",
     "size_warnings",
 ]

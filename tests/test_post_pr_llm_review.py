@@ -390,6 +390,32 @@ def test_parse_diff_skips_no_newline_at_end_of_file_marker() -> None:
     assert parse_diff_right_side(diff) == {"foo.py": {1}}
 
 
+def test_parse_diff_keeps_hunk_after_deleted_content_starting_with_dashes() -> None:
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,3 +1,2 @@\n"
+        " context_before\n"
+        "--- deleted_content\n"
+        " context_after\n"
+    )
+    assert parse_diff_right_side(diff) == {"foo.py": {1, 2}}
+
+
+def test_parse_diff_keeps_hunk_after_added_content_starting_with_pluses() -> None:
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " context_before\n"
+        "+++ added_content\n"
+        " context_after\n"
+    )
+    assert parse_diff_right_side(diff) == {"foo.py": {1, 2, 3}}
+
+
 def test_parse_diff_terminates_hunk_on_unknown_marker() -> None:
     """An unrecognised first character ends the current hunk cleanly.
 

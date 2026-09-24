@@ -10,6 +10,24 @@ should be considered stable but subject to additive change.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Model-aware hosted LLM cost limits (#150):** resolve explicit per-model
+  input/output prices for pre-flight and post-hoc checks; skip unknown model
+  pricing rather than assuming mini rates, and validate paired price settings.
+
+- **Analysis rate-limit accounting (#153):** charge after worker lock,
+  cache, dedupe, and context gates; use an atomic Redis natural-key marker
+  to avoid consuming additional quota on retries.
+
+### Added
+
+- Configurable meaningful PR-description length limits with `overlong_pr_body` warnings and validation (#142).
+
+### Fixed
+
+- Write the final analysis cache only after a successful database commit, so failed transactions cannot leave false cached results (#152).
+
 ### Changed
 
 - **PR follow-up (stable API + guards):** ``PrAuthorKind``, automation login
@@ -31,6 +49,52 @@ should be considered stable but subject to additive change.
 
 ### Added
 
+- **Per-file LOC thresholds (#171):** optional configurable warn/fail limits, per-check path exemptions, deterministic `file_too_large` warnings, and normal verdict/label integration.
+- **Excessive code-comment verbosity heuristic (issue #143):** new
+  [`code_comments.py`](src/reviewgate/core/code_comments.py) core module
+  emits deterministic `oversized_comment_block`, `excessive_comment_lines`,
+  and `comment_heavy_diff` warnings from the added lines of
+  `ChangedFile.patch` only. Eligibility reuses the categorizer's
+  `source` + `human_authored` verdict; a conservative lexical scanner
+  recognizes full-line `#` / `//` / `/* */` comments in Python, Shell,
+  JavaScript, TypeScript (not JSX/TSX), and Go while never counting
+  string literals (including Python docstrings) or trailing comments;
+  the one documented exception is a hunk that begins inside a docstring
+  opened above Git's context window (see README).
+  Java, C/C++, C#, Rust, and JSX/TSX are skipped until their multiline
+  string forms are modeled. Configured via the new `policy.code_comments`
+  block (warn/fail thresholds, ratio sample-size guard, `enabled` toggle);
+  adds `comment_lines_added`, `code_lines_added`,
+  `largest_comment_block_lines`, and `comment_ratio` stats when enabled,
+  and maps no new labels (existing §10.13 aggregation is unchanged).
+  Follow-up to the #144 review: unchanged context lines participate in
+  lexical classification without being tallied; JS/Go backtick strings
+  and shell quotes/heredocs carry across lines;
+  `oversized_comment_block` is one PR-level warning for the maximum
+  block (filename in evidence), matching `size_warnings`;
+  `files` / `file_categories` pairs are rejected when filenames differ;
+  unified-diff file headers are detected by position rather than by
+  content; unclassified source languages join the `comment_ratio`
+  denominator instead of vanishing from it; mid-file hunks are analyzed
+  once their own context establishes a normal code position, and that
+  establishment requires a code token on each evidential context line
+  rather than merely a clean scan.
+  Hunks that do not start at new-file line 0 or 1 are no longer skipped
+  outright: they are analyzed once their own context lines establish a
+  normal code position (two consecutive context lines that all scan
+  clean), so an ordinary mid-file edit -- the case issue #143 describes
+  -- is measured instead of ignored. Unified-diff file headers are now
+  detected by position (everything before the first `@@` is preamble)
+  rather than by a `+++ ` / `--- ` content match, which closes collisions
+  with an added `++i` and a deleted shell `-- )`. An in-scope source file
+  whose language is not modeled now contributes its added non-blank
+  lines to the `comment_ratio` denominator (never the numerator), so an
+  unparsed language can no longer inflate the ratio. The scanner moved
+  to [`_comment_lex.py`](src/reviewgate/core/_comment_lex.py) and
+  [`_comment_scan.py`](src/reviewgate/core/_comment_scan.py), and the
+  `CodeComment*` policy models to
+  [`comment_policy.py`](src/reviewgate/core/comment_policy.py), keeping
+  every non-test source file under the CONTRIBUTING.md LOC preference.
 - **OSS polish (issue #126):** [`GOVERNANCE.md`](GOVERNANCE.md); canonical
   hosted-stack local guide [`docs/HOSTED_LOCAL.md`](docs/HOSTED_LOCAL.md) with
   README cross-links (including Dependabot, already configured in

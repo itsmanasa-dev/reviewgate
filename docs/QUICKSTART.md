@@ -182,9 +182,12 @@ thresholds:
   warn:
     files_changed: 25
     human_loc_changed: 800
+    per_file_human_loc: 0  # optional; e.g. 300
   fail:
     files_changed: 75
     human_loc_changed: 2500
+    per_file_human_loc: 0  # optional; e.g. 800
+  per_file_loc_exempt_paths: []  # exempt only this check, e.g. ["testdata/**"]
 
 # §10.6 — paths the engine treats as risky. Defaults already cover
 # migrations, auth, billing, payments, infra/terraform, and
@@ -201,6 +204,17 @@ policy:
   require_linked_issue: true
   require_human_summary: true
   fail_on_risky_paths_without_context: true
+  code_comments: # issue #143, comment-verbosity limits
+    enabled: true # false disables the heuristic and its stats keys
+    warn:
+      max_block_lines: 10
+      max_total_lines: 60
+      max_comment_ratio: 0.45
+    fail:
+      max_block_lines: 25
+      max_total_lines: 150
+      max_comment_ratio: 0.70
+    min_added_source_lines: 20 # ratio stays silent below this sample size
 
 # §13.9 — labels applied by the hosted App. The Action does not
 # manage labels yet (#52); listing them here is harmless.

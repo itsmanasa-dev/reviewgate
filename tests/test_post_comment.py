@@ -53,9 +53,9 @@ class _StubOpener:
 
     Each entry is ``(method, url_substring, status_or_body, headers)``.
     ``status_or_body`` is either a ``bytes`` payload (success) or an
-    ``HTTPError`` instance (error). The opener pops entries in order
-    and asserts the request matches; tests with branchy logic should
-    spell out every expected call.
+    ``HTTPError``, ``URLError``, or ``OSError`` instance (error). The
+    opener pops entries in order and asserts the request matches; tests
+    with branchy logic should spell out every expected call.
     """
 
     def __init__(
@@ -83,7 +83,7 @@ class _StubOpener:
             f"{request.full_url!r}"
         )
         self.requests.append(request)
-        if isinstance(payload, urllib.error.HTTPError):
+        if isinstance(payload, Exception):
             raise payload
         assert isinstance(payload, bytes)
         return _StubResponse(payload, headers)
@@ -412,6 +412,72 @@ def test_upsert_comment_translates_http_error_to_runtime_error() -> None:
             summary_md="x",
             opener=opener,
         )
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (
+            urllib.error.URLError("DNS lookup failed"),
+            "network error: DNS lookup failed",
+        ),
+        (TimeoutError("request timed out"), "network error: request timed out"),
+        (
+            ConnectionResetError("connection reset by peer"),
+            "network error: connection reset by peer",
+        ),
+    ],
+)
+def test_upsert_comment_translates_network_errors_to_runtime_error(
+    error: Exception, message: str
+) -> None:
+    report = _make_report()
+    opener = _StubOpener(
+        [
+            (
+                "GET",
+                "/issues/16/comments",
+                error,
+                {},
+            )
+        ]
+    )
+    with pytest.raises(RuntimeError, match=message):
+        post_comment.upsert_comment(
+            owner="o",
+            repo="r",
+            pull_number=16,
+            token="t",
+            report=report,
+            summary_md="x",
+            opener=opener,
+        )
+
+
+def test_upsert_from_environment_reports_network_failure_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _make_report()
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def failing_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", failing_urlopen)
+
+    outcome = post_comment.upsert_from_environment(
+        report=report,
+        summary_md="x",
+        repo_arg=None,
+        pull_arg=17,
+        log_prefix="reviewgate",
+    )
+
+    assert outcome.ok is False
+    assert outcome.action == "failed"
+    assert "network error" in outcome.message
+    assert "pull-requests: write" not in outcome.message
 
 
 def test_upsert_comment_raises_on_unexpected_post_response() -> None:
