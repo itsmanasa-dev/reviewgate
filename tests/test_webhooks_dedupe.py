@@ -312,6 +312,7 @@ def test_mark_github_webhook_delivery_processed_success_with_token(
     """mark_github_webhook_delivery_processed executes update setting processed=True and commits."""
     fake_engine = object()
     session = MagicMock()
+    session.execute.return_value.rowcount = 1
     sm = _session_context(session)
     token = uuid.uuid4()
 
@@ -323,12 +324,13 @@ def test_mark_github_webhook_delivery_processed_success_with_token(
             "reviewgate.app.webhooks.dedupe.create_session_factory",
             return_value=sm,
         ):
-            mark_github_webhook_delivery_processed(
+            marked = mark_github_webhook_delivery_processed(
                 app_settings,
                 delivery_id="deliv-done-1",
                 claim_token=token,
             )
 
+    assert marked is True
     session.execute.assert_called_once()
     executed_stmt = session.execute.call_args[0][0]
     compiled_str = str(executed_stmt.compile(compile_kwargs={"literal_binds": True}))
@@ -336,6 +338,36 @@ def test_mark_github_webhook_delivery_processed_success_with_token(
     assert "webhook_deliveries.github_delivery_id = 'deliv-done-1'" in compiled_str
     assert (token.hex in compiled_str or str(token) in compiled_str)
     session.commit.assert_called_once()
+
+
+def test_mark_github_webhook_delivery_processed_stale_token_returns_false_and_logs(
+    app_settings: AppSettings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A superseded claim_token matches zero rows: returns False and logs a warning."""
+    fake_engine = object()
+    session = MagicMock()
+    session.execute.return_value.rowcount = 0
+    sm = _session_context(session)
+
+    with patch(
+        "reviewgate.app.webhooks.dedupe.create_engine_from_settings",
+        return_value=fake_engine,
+    ):
+        with patch(
+            "reviewgate.app.webhooks.dedupe.create_session_factory",
+            return_value=sm,
+        ):
+            with caplog.at_level("WARNING", logger="reviewgate.app.webhooks.dedupe"):
+                marked = mark_github_webhook_delivery_processed(
+                    app_settings,
+                    delivery_id="deliv-stale-1",
+                    claim_token=uuid.uuid4(),
+                )
+
+    assert marked is False
+    session.commit.assert_called_once()
+    assert "deliv-stale-1" in caplog.text
 
 
 def test_mark_github_webhook_delivery_processed_operational_error_raises(

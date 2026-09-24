@@ -1738,6 +1738,9 @@ create index idx_webhook_deliveries_created_at on webhook_deliveries(created_at)
 -- 3. active: processed=false with active lease held by in-flight worker (surfaces 503 retryable).
 -- 4. lease timeout: configurable via REVIEWGATE_WEBHOOK_DELIVERY_LEASE_SECONDS (default 180s).
 -- 5. release: resets claimed_at to epoch only if matching claim_token and processed=false.
+-- 6. not exactly-once: the lease only bounds the duplicate-enqueue window. After it
+--    expires a redelivery can reclaim and enqueue again; duplicate processing is
+--    prevented by the §13.7 worker lock (worker_job_lock_hold) and analyses lifecycle.
 
 -- Cleanup job requirement:
 -- delete webhook_deliveries older than 30 days daily.

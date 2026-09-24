@@ -1176,7 +1176,13 @@ def test_github_webhook_enqueue_failure_cleans_up_debounce_and_claim(
 def test_github_webhook_send_success_mark_processed_failure_does_not_release_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Issue #154: If send succeeds but mark_processed fails, claim is NOT released (prevents duplicate enqueue)."""
+    """Issue #154: If send succeeds but mark_processed fails, the claim is NOT released.
+
+    This bounds the duplicate-enqueue window to one lease (a redelivery gets
+    "active" until ``webhook_delivery_lease_seconds`` expires); it does not
+    make duplicate enqueue impossible. Final duplicate-processing protection
+    is the worker's §13.7 ``worker_job_lock_hold`` and ``analyses`` lifecycle.
+    """
 
     from sqlalchemy.exc import OperationalError
 

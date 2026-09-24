@@ -1,10 +1,22 @@
-"""GitHub webhook delivery dedupe using ``webhook_deliveries`` (``docs/DESIGN.md`` §13.3, §16.1)."""
+"""GitHub webhook delivery dedupe using ``webhook_deliveries`` (``docs/DESIGN.md`` §13.3, §16.1).
+
+The delivery claim is **not** an exactly-once guarantee. A claim lease
+(``webhook_delivery_lease_seconds``) bounds how long an in-flight or crashed
+attempt blocks a GitHub redelivery; once it expires, a redelivery of the same
+``X-GitHub-Delivery`` id may reclaim the row and enqueue the analysis job a
+second time. Duplicate *processing* is prevented downstream by the worker
+(``docs/DESIGN.md`` §13.7): the Redis job lock
+(:func:`reviewgate.app.analysis.worker_job_lock.worker_job_lock_hold`) for
+concurrent runs, and the ``analyses`` row lifecycle
+(``already_running`` / ``already_completed``) for later ones.
+"""
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Final, Literal
+from typing import Literal
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -14,11 +26,9 @@ from reviewgate.app.settings import AppSettings
 from reviewgate.app.storage.db import create_engine_from_settings, create_session_factory
 from reviewgate.app.storage.models import WebhookDelivery
 
-ClaimResult = Literal["claimed", "duplicate", "active", "database_unavailable"]
+logger = logging.getLogger(__name__)
 
-#: Maximum duration in seconds a delivery claim/lease is held before an in-flight
-#: or crashed attempt is considered expired and can be reclaimed by a retry.
-_DEFAULT_LEASE_TIMEOUT_SECONDS: Final[int] = 180
+ClaimResult = Literal["claimed", "duplicate", "active", "database_unavailable"]
 
 
 def claim_github_webhook_delivery(
@@ -70,7 +80,7 @@ def claim_github_webhook_delivery(
     lease_seconds = (
         lease_timeout_seconds
         if lease_timeout_seconds is not None
-        else getattr(settings, "webhook_delivery_lease_seconds", _DEFAULT_LEASE_TIMEOUT_SECONDS)
+        else settings.webhook_delivery_lease_seconds
     )
     now = datetime.now(timezone.utc)
     stale_cutoff = now - timedelta(seconds=lease_seconds)
@@ -169,13 +179,20 @@ def mark_github_webhook_delivery_processed(
     *,
     delivery_id: str,
     claim_token: uuid.UUID | None = None,
-) -> None:
+) -> bool:
     """Mark a delivery as successfully processed in ``webhook_deliveries``.
 
     Args:
         settings: Application settings (``REVIEWGATE_DATABASE_URL``).
         delivery_id: ``X-GitHub-Delivery`` header value.
         claim_token: Optional ownership token matching the current lease.
+
+    Returns:
+        ``True`` when a row was updated. ``False`` when nothing matched -- e.g.
+        ``claim_token`` was superseded because this lease expired and a
+        redelivery reclaimed the row. The write is then discarded (the newer
+        claimant owns the row) and a warning is logged; callers must not assume
+        ``processed=True`` landed.
 
     Raises:
         RuntimeError: If ``settings.database_url`` is unset (callers must gate).
@@ -204,8 +221,16 @@ def mark_github_webhook_delivery_processed(
             .values(processed=True)
         )
         try:
-            session.execute(stmt)
+            matched = session.execute(stmt).rowcount
             session.commit()
         except OperationalError:
             session.rollback()
             raise
+    if matched == 0:
+        logger.warning(
+            "webhook delivery %s not marked processed: no row matched the claim token "
+            "(lease likely expired and was reclaimed by a newer delivery attempt)",
+            delivery_id,
+        )
+        return False
+    return True

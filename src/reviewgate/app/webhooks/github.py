@@ -488,6 +488,13 @@ async def github_webhook(request: Request) -> Response:
         )
         raise
 
+    # The job is already enqueued, so a failure to record it deliberately does
+    # NOT release the claim: an immediate redelivery gets "active" (503) instead
+    # of enqueueing again. This only bounds the duplicate-enqueue window to one
+    # ``webhook_delivery_lease_seconds`` lease -- after it expires a redelivery
+    # reclaims the row and enqueues a second job. Duplicate *processing* is
+    # stopped by the worker (§13.7): ``worker_job_lock_hold`` for concurrent
+    # runs and the ``analyses`` row (``already_running`` / ``already_completed``).
     try:
         await run_in_threadpool(
             mark_github_webhook_delivery_processed,
